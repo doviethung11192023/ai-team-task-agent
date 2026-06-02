@@ -1,6 +1,8 @@
 # 🤖 AI Team Task Management Agent
 
-> **Hệ thống AI Agent quản lý công việc nhóm thông minh** — hỗ trợ tạo dự án, phân chia task, theo dõi tiến độ, nhắc deadline và quản lý rủi ro tự động. Xây dựng trên kiến trúc Multi-Agent với LangGraph + Google Gemini.
+> **Hệ thống AI Agent quản lý công việc nhóm thông minh** — hỗ trợ tạo/quản lý dự án thủ công, gợi ý phân công (AI), theo dõi tiến độ phân cấp, nhắc deadline đa mốc và quản lý rủi ro tự động. Xây dựng trên kiến trúc Multi-Agent với LangGraph + Google Gemini.
+
+> **🔄 REFACTORED (v2.0):** Project và Task do **con người tạo** qua UI Form. AI chỉ đóng vai trò trợ lý: gợi ý assignment, phân tích rủi ro, theo dõi tiến độ, nhắc nhở. Planner Agent đã bị loại bỏ hoàn toàn.
 
 ---
 
@@ -28,63 +30,72 @@
 ## 🏗 Tổng Quan Kiến Trúc
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      FRONTEND (Streamlit)                           │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │  Tab 1: Chat với AI Agent    │  Tab 2: Dashboard              │  │
-│  │  - Chat messages             │  - Overview (progress, tasks)  │  │
-│  │  - Human-in-loop approval    │  - Team Management             │  │
-│  │  - User input field          │  - Risks                       │  │
-│  │                              │  - System Monitoring           │  │
-│  └──────────────────────────────┴────────────────────────────────┘  │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           │ HTTP (POST /chat)
-                           ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                       BACKEND (FastAPI :8000)                       │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │  POST /chat  │  POST /start-reminder  │  GET /health         │  │
-│  └──────────────────────────┬───────────────────────────────────┘  │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                   LANGGRAPH ORCHESTRATOR                            │
-│                                                                     │
-│  ┌──────────┐    ┌──────────────┐    ┌──────────────┐              │
-│  │supervisor│───▶│   planner    │───▶│ task_divider │              │
-│  └──────────┘    └──────────────┘    └──────┬───────┘              │
-│       │                                     │                      │
-│       │  ┌──────────────────┐               ▼                      │
-│       ├──▶ progress_tracker │         ┌──────────────┐              │
-│       │  └──────────────────┘         │    risk      │              │
-│       │                               └──────┬───────┘              │
-│       │  ┌──────────────────┐                │                     │
-│       └──▶    reminder      │◀───────────────┤                     │
-│          └──────────────────┘                │                     │
-│                                        ┌─────▼──────┐              │
-│                                        │human_approval│ (nếu rủi ro │
-│                                        └─────┬───────┘  cao >= 7)  │
-│                                              │                     │
-│                                              └──▶ reminder         │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                             FRONTEND (Streamlit :8501)                           │
+│  ┌────────────────────────────────────────────────────────────────────────────┐  │
+│  │  Tab 1: Chat với AI Agent          │  Tab 2: Dashboard (6 subtabs)         │  │
+│  │  - Chat messages                   │  - Overview (tree + metrics)          │  │
+│  │  - Human-in-loop approval          │  - Task Management (CRUD + tree)      │  │
+│  │  - User input field                │  - Team Management (members + create) │  │
+│  │                                    │  - Risks                              │  │
+│  │                                    │  - Assignment Review (AI + approve)   │  │
+│  │                                    │  - System Monitoring                  │  │
+│  └────────────────────────────────────┴───────────────────────────────────────┘  │
+└──────────────────────────┬───────────────────────────────────────────────────────┘
                            │
-           ┌───────────────┼───────────────┐
-           ▼               ▼               ▼
+                           ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                          BACKEND (FastAPI :8000)                                  │
+│  ┌────────────────────────────────────────────────────────────────────────────┐  │
+│  │  POST /chat  │  REST API (/api/projects/*, /api/tasks/*, /api/users...)   │  │
+│  │  POST /start-reminder  │  GET /health                                     │  │
+│  └────────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────┬───────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                          LANGGRAPH ORCHESTRATOR                                   │
+│                                                                                  │
+│  ┌──────────┐    ┌──────────────┐    ┌──────────────┐                           │
+│  │supervisor│───▶│ task_divider │───▶│      END      │  (chỉ recommend)          │
+│  └─────┬────┘    └──────────────┘    └──────────────┘                           │
+│        │                                                                        │
+│        │  ┌──────────────────┐                                                  │
+│        ├──▶ progress_tracker │───▶ reminder ──▶ END                             │
+│        │  └──────────────────┘                                                  │
+│        │                                                                        │
+│        │  ┌──────────────────┐                                                  │
+│        └──▶risk_assessment───┤                                                  │
+│           └────────┬─────────┘                                                  │
+│                    │                                                            │
+│                    ▼                                                            │
+│           ┌──────────────────┐                                                  │
+│           │ human_approval   │──▶ (approved) ──▶ reminder ──▶ END               │
+│           └──────────────────┘──▶ (rejected) ──▶ END                           │
+│                                                                                  │
+│   *** PLANNER AGENT ĐÃ BỊ LOẠI BỎ ***                                           │
+│   *** Project/Task được tạo thủ công qua UI ***                                 │
+└──────────────────────────┬───────────────────────────────────────────────────────┘
+                           │
+            ┌──────────────┼──────────────┐
+            ▼              ▼              ▼
 ┌─────────────────┐ ┌──────────┐ ┌──────────────┐
 │  PostgreSQL DB  │ │  Redis   │ │  Slack API   │
-│  (Supabase)     │ │  Cache   │ │  Notifications│
+│  (psycopg2)     │ │  Cache   │ │  Notifications│
 └─────────────────┘ └──────────┘ └──────────────┘
 ```
 
 ### Luồng dữ liệu tổng quát:
 
-1. **User** nhập input qua Streamlit Chat (hoặc API)
-2. **FastAPI** nhận request → gọi `orchestrator.invoke()`
-3. **Supervisor Node** xác định intent → route tới agent phù hợp
-4. **Agent** gọi **Gemini LLM** với system prompt chuyên biệt
-5. **Kết quả** được lưu xuống **PostgreSQL**, cache vào **Redis**
-6. Nếu có rủi ro cao → chờ **Human-in-the-Loop** approve/reject
-7. Cuối cùng **Reminder** kiểm tra deadline và gửi **Slack notification**
+1. **Human PM** tạo project/task thủ công qua **Dashboard UI** (hoặc REST API)
+2. **User** chat với AI Agent qua Streamlit (hoặc FastAPI `/chat`)
+3. **FastAPI** nhận request → gọi `orchestrator.invoke()`
+4. **Supervisor Node** xác định intent → route tới agent phù hợp
+5. **Agent** gọi **Gemini LLM** với system prompt chuyên biệt
+6. **Kết quả** được lưu xuống **PostgreSQL**, cache vào **Redis**
+7. Nếu AI Task Divider gợi ý assignment → **PM Review** trước khi lưu
+8. Nếu có rủi ro cao (score >= 7) → chờ **Human-in-the-Loop** approve/reject
+9. Cuối cùng **Reminder** kiểm tra deadline đa mốc (7/3/1 ngày) và gửi **Slack notification**
 
 ---
 
@@ -116,12 +127,11 @@ E:\agent\ai-team-task-agent\
 ├── app/                                    # Backend source code
 │   ├── main.py                             # FastAPI entry point (port 8000)
 │   │
-│   ├── agents/                             # Các AI Agent (5 agents)
-│   │   ├── planner_agent.py                # Planner: tạo project từ NL
-│   │   ├── task_divider.py                 # Task Divider: chia task, gán người
-│   │   ├── risk_agent.py                   # Risk: phân tích rủi ro
-│   │   ├── progress_tracker.py             # Progress: theo dõi tiến độ
-│   │   └── reminder_agent.py              # Reminder: nhắc deadline Slack
+│   ├── agents/                             # Các AI Agent (4 agents)
+│   │   ├── task_divider.py                 # Task Divider: gợi ý assignment (top-3)
+│   │   ├── risk_agent.py                   # Risk: phân tích rủi ro (rule + LLM)
+│   │   ├── progress_tracker.py             # Progress: theo dõi tiến độ phân cấp
+│   │   └── reminder_agent.py              # Reminder: nhắc deadline Slack (7/3/1 ngày)
 │   │
 │   ├── database/                           # Database clients
 │   │   ├── supabase_client.py              # PostgreSQL direct (psycopg2)
@@ -136,8 +146,9 @@ E:\agent\ai-team-task-agent\
 │   ├── models/                             # Pydantic data models
 │   │   └── schemas.py                      # User, Project, Task, Risk, State, Response
 │   │
-│   ├── prompts/                            # LLM system prompts
-│   │   └── planner_prompts.py              # 4 prompts + 1 helper function
+│   ├── prompts/                            # LLM system prompts (split)
+│   │   ├── task_divider_prompts.py          # TASK_DIVIDER_SYSTEM_PROMPT
+│   │   ├── risk_prompts.py                  # RISK_SYSTEM_PROMPT
 │   │
 │   ├── tools/                              # Tool functions cho agents
 │   │   ├── task_tools.py                   # create_project, create_tasks_batch, etc.
@@ -151,7 +162,7 @@ E:\agent\ai-team-task-agent\
 │       └── slack_client.py                 # send_slack_notification wrapper
 │
 ├── frontend/                               # Streamlit UI
-│   ├── streamlit_app.py                    # Main UI (2 tabs, 4 subtabs)
+│   ├── streamlit_app.py                    # Main UI (2 tabs, 6 subtabs)
 │   ├── components/
 │   │   ├── chat.py                         # [PLACEHOLDER] chưa triển khai
 │   │   └── dashboard.py                    # [PLACEHOLDER] chưa triển khai
@@ -166,11 +177,10 @@ E:\agent\ai-team-task-agent\
 │   ├── schema.sql                          # 7 tables, indexes, triggers
 │   └── seed_data.sql                       # Seed data (trống)
 │
-├── tests/                                  # Pytest tests
-│   ├── test_chat_flow_routing.py           # 4 tests: flow, routing, endpoint
-│   ├── test_none_list_regression.py        # 1 test: None-list edge case
-│   ├── test_risk_agent_context.py          # 1 test: risk agent context
-│   └── test_task_divider_serialization.py  # 1 test: datetime serialization
+├── tests/                                  # Pytest tests (3 files, all pass)
+│   ├── test_none_list_regression.py        # None-list edge case
+│   ├── test_risk_agent_context.py          # Risk agent context + datetime serialization
+│   └── test_task_divider_serialization.py  # Task divider recommendation output
 │
 ├── config.py                               # Config singleton từ .env
 ├── requirements.txt                        # Python dependencies
@@ -295,76 +305,74 @@ Tất cả agent đều dùng **ChatGoogleGenerativeAI** với model **gemini-2.
 
 | Agent | File | Temperature | Cache TTL | Mô tả |
 |-------|------|-------------|-----------|-------|
-| **Planner** | `planner_agent.py` | 0.3 | 30 min | Phân tích yêu cầu → tạo project + task thô + rủi ro ban đầu |
-| **Task Divider** | `task_divider.py` | 0.2 | 20 min | Chia task chi tiết, gán người dựa trên kỹ năng & workload |
-| **Risk Agent** | `risk_agent.py` | 0.3 | 15 min | Phân tích rủi ro từ project data + tasks |
-| **Progress Tracker** | `progress_tracker.py` | 0.3 | No cache | Tính % hoàn thành từ tasks → cập nhật DB → response |
-| **Reminder** | `reminder_agent.py` | N/A | No cache | Check deadline, gửi Slack notification |
+| **Task Divider** | `task_divider.py` | 0.2 | 20 min | Gợi ý assignment top-3/task dựa trên kỹ năng & workload (KHÔNG tạo task) |
+| **Risk Agent** | `risk_agent.py` | 0.3 | 15 min | Phát hiện rủi ro bằng rule (overdue, workload, progress) + LLM bổ sung |
+| **Progress Tracker** | `progress_tracker.py` | 0.3 | No cache | Tính % hoàn thành phân cấp (parent = avg children), cập nhật DB |
+| **Reminder** | `reminder_agent.py` | N/A | No cache | Check deadline 4 mốc (7/3/1 ngày + quá hạn), gửi Slack + assignee-aware |
 
 ### Chi tiết từng Agent:
 
-#### 1. Planner Agent
-- **Input:** `user_input`, `user_id`, `team_members`
-- **Output:** `AgentResponse` với `project_id`, `project_data`
-- **Cache key:** `planner:{md5(input)[:20]}`
-- **Flow:**
-  1. Check Redis cache
-  2. Build prompt từ `PLANNER_SYSTEM_PROMPT` + user input
-  3. LLM trả về JSON: project_name, tasks (8-15), initial_risks
-  4. Parse JSON (fallback nếu parse lỗi)
-  5. `db.create_project()` → lưu project
-  6. Cache result (30 min)
-  7. Trả về AgentResponse
-
-#### 2. Task Divider Agent
+#### 1. Task Divider Agent (REFACTORED)
+- **Vai trò:** Chỉ **gợi ý assignment**, KHÔNG tạo task, KHÔNG lưu DB
 - **Input:** `project_id`, `project_data`, `raw_tasks`
-- **Output:** `AgentResponse` với danh sách task đã gán người
+- **Output:** `AgentResponse` với danh sách recommendations (top-3 user/task)
 - **Cache key:** `task_divider:{project_id}` (20 min)
 - **Flow:**
   1. Check cache
-  2. Lấy `team_members` từ DB
-  3. Build prompt với `TASK_DIVIDER_SYSTEM_PROMPT`
-  4. LLM trả về JSON: assigned_tasks (mỗi task có `assigned_to`)
-  5. Parse JSON
-  6. `_resolve_assignee_user_id()` → match user_id/name/email
-  7. `db.create_tasks_batch()` (max 12 tasks)
-  8. Tự động tạo `project_members` nếu user chưa có trong project
-  9. `db.create_task_assignments_batch()`
-  10. Cache result
+  2. Lấy `team_members` từ DB (users)
+  3. Build prompt với `TASK_DIVIDER_SYSTEM_PROMPT` (từ `task_divider_prompts.py`)
+  4. LLM trả về JSON: assigned_tasks (mỗi task có `assigned_to` + `reason`)
+  5. Parse JSON, resolve assignee user_id
+  6. Trả về recommendations → **PM Review** trong Dashboard trước khi lưu
+  7. Cache result
 
-#### 3. Risk Agent
+#### 2. Risk Agent (REFACTORED)
+- **Vai trò:** Phát hiện rủi ro bằng **rule-based + LLM**
 - **Input:** `project_id`, `project_data`, `tasks`
-- **Output:** `AgentResponse` với danh sách risks
+- **Output:** `AgentResponse` với danh sách risks (merged rule + LLM)
 - **Cache key:** `risk:{project_id}` (15 min)
+- **Rule-based detection:**
+  - Task overdue (>= 2 overdue → High risk)
+  - High workload (>= 5 tasks assigned)
+  - Progress thấp (< 20%)
 - **Flow:**
   1. Check cache
-  2. Load project + tasks từ `project_data` hoặc DB fallback
-  3. Build prompt với `RISK_SYSTEM_PROMPT`
-  4. LLM trả về JSON: risks array
-  5. `db.create_risks_batch()` (max 6 risks)
-  6. Cache result
+  2. Load project + tasks từ project_data hoặc DB fallback
+  3. Chạy rule-based detection trước
+  4. Build prompt với `RISK_SYSTEM_PROMPT` (từ `risk_prompts.py`) + rule results
+  5. LLM trả về JSON: risks array (bổ sung, không trùng lặp)
+  6. Merge + dedup risks by title
+  7. `db.create_risks_batch()` (max 10 risks)
+  8. Cache result
 
-#### 4. Progress Tracker Agent
+#### 3. Progress Tracker Agent (REFACTORED)
+- **Vai trò:** Tính tiến độ **phân cấp** từ subtask lên task cha
 - **Input:** `project_id`, `user_input`
-- **Output:** `AgentResponse` với progress %
+- **Output:** `AgentResponse` với progress %, phân tích chi tiết
 - **Flow:**
   1. Guard: cần valid project_id
-  2. `db.calculate_project_progress()` → % task Done
-  3. `db.update_project_progress()`
-  4. LLM tạo response phân tích tiến độ
+  2. Lấy tasks từ DB, build task tree
+  3. Tính hierarchical progress: leaf = từ status (Done=100%, InProgress=50%), parent = average children
+  4. `db.update_project_progress()`
+  5. LLM tạo response phân tích (có context tree structure)
+  6. Response bao gồm: overall %, completed leaves, overdue/blocked counts
 
-#### 5. Reminder Agent
+#### 4. Reminder Agent (REFACTORED)
+- **Vai trò:** Nhắc deadline đa mốc, bao gồm tên người được gán
 - **Input:** `project_id` (optional — nếu None thì check all active projects)
 - **Output:** `AgentResponse` với thông báo tổng kết
+- **Deadline thresholds:**
+  - `days_left == 7` → 📋 Nhắc sớm
+  - `days_left == 3` → ⏰ Sắp đến hạn
+  - `days_left == 1` → 🚨 Cảnh báo khẩn
+  - `days_left < 0` → ❌ Quá hạn
 - **Flow:**
   1. Load project(s)
-  2. Với mỗi project, load tasks
-  3. Check từng task's due_date:
-     - `days_left == 3` → ⏰ normal reminder
-     - `days_left == 1` → 🚨 urgent
-     - `days_left < 0` → ❌ quá hạn
-  4. Mỗi notification → `notification_tools.send_notification()` (Slack)
-  5. Push summary log vào Redis list `reminder_logs` (max 100)
+  2. Với mỗi project, load tasks + task_assignments
+  3. Build assignee map (task_id → assignee_name)
+  4. Check từng task's due_date, gửi notification theo threshold
+  5. Mỗi notification → `notification_tools.send_notification()` (Slack) + log
+  6. Push summary log vào Redis list `reminder_logs` (max 100)
 
 ---
 
@@ -395,45 +403,45 @@ class AgentState(TypedDict):
 - Chống duplicate messages (prefix matching)
 - Giới hạn `MAX_MESSAGE_HISTORY = 20`
 
-### Nodes (7 nodes)
+### Nodes (6 nodes)
 
 | Node | Function | Responsibility |
 |------|----------|----------------|
-| `supervisor` | `supervisor_node()` | Entry point — route dựa trên intent & state |
-| `planner` | `planner_node()` | Gọi Planner Agent, set project_data + project_id |
-| `task_divider` | `task_divider_node()` | Gọi Task Divider Agent, tạo tasks + assignments |
-| `risk_assessment` | `risk_assessment_node()` | Gọi Risk Agent, set needs_human_approval |
-| `progress_tracker` | `progress_tracker_node()` | Gọi Progress Tracker, update progress |
-| `reminder` | `reminder_node()` | Gọi Reminder Agent, có guard chống re-entry |
-| `human_approval` | `human_approval_node()` | Xử lý approval/rejection |
+| `supervisor` | `supervisor_node()` | Entry point — route dựa trên intent keywords |
+| `task_divider` | `task_divider_node()` | Gọi Task Divider Agent (chỉ recommend, không lưu DB) |
+| `risk_assessment` | `risk_assessment_node()` | Gọi Risk Agent (rule + LLM), set needs_human_approval |
+| `progress_tracker` | `progress_tracker_node()` | Gọi Progress Tracker (hierarchical), update progress |
+| `reminder` | `reminder_node()` | Gọi Reminder Agent (7/3/1 ngày + quá hạn), có guard chống re-entry |
+| `human_approval` | `human_approval_node()` | Xử lý approval/rejection rủi ro cao |
+
+**Lưu ý:** `planner_node` đã bị **xóa hoàn toàn** khỏi graph. Project/task được tạo thủ công qua UI, không qua AI.
 
 ### Routing Logic (Supervisor)
 
 ```
-SUPERVISOR ROUTING:
+SUPERVISOR ROUTING (REFACTORED — đã xóa planner):
 ├── needs_human_approval & chưa có response → human_approval
 ├── approval_response == "approved"/"rejected" → human_approval
-├── KHÔNG có project_id:
-│   ├── Có CREATE_INTENT_KEYWORDS → planner
-│   └── Không → END (yêu cầu chọn project)
-├── CÓ project_id:
-│   ├── CREATE_INTENT_KEYWORDS → planner (phase=planning)
-│   ├── "update" / "tiến độ" → progress_tracker
-│   ├── "rủi ro" → risk_assessment
-│   └── default: phase=planning → task_divider, else → planner
+├── KHÔNG có project_id → END (yêu cầu tạo project từ Dashboard UI)
+└── CÓ project_id:
+    ├── "update" / "tiến độ" / "progress" → progress_tracker
+    ├── "rủi ro" / "risk" / "phân tích" → risk_assessment
+    ├── "gợi ý" / "đề xuất" / "assign" / "phân công" → task_divider
+    ├── "nhắc" / "remind" / "deadline" / "hạn" → reminder
+    └── fallback → END (hướng dẫn user dùng Dashboard UI)
 ```
 
 ### Graph Edges
 
 ```
-supervisor → [conditional] → planner / task_divider / progress_tracker / risk_assessment / human_approval / END
-planner → task_divider
-task_divider → risk_assessment
+supervisor → [conditional] → task_divider / progress_tracker / risk_assessment / human_approval / END
+task_divider → END  (chỉ recommend, không tự động chain)
+progress_tracker → reminder → END
 risk_assessment → [conditional] → human_approval (nếu rủi ro >= 7) / reminder (nếu an toàn) / END (nếu reject)
-progress_tracker → reminder
 human_approval → [conditional] → reminder (approve) / END (reject)
-reminder → END
 ```
+
+**Lưu ý:** `planner → task_divider` edge đã bị xóa. `task_divider → END` (không còn tự động chạy risk assessment sau khi divide).
 
 ### Thresholds
 - `HIGH_RISK_THRESHOLD = 7` — risk_score >= 7 → cần human approval
@@ -448,85 +456,98 @@ reminder → END
 - `route_after_approval(state)` — sau human approval
 
 ### Intent Keywords (`CREATE_INTENT_KEYWORDS`)
-26 phrases (Vietnamese + English): "tạo project", "tao du an", "dự án mới", "new project", "khởi tạo", v.v.
+Đã **xóa** toàn bộ — project không còn được tạo qua chat.
 
 ---
 
 ## 🔄 End-to-End Flows
 
-### Flow 1: Tạo Project Mới (Complete Pipeline)
+### Flow 1: PM Tạo Project + Task (Human — không AI)
 ```
-User: "Tao project phat trien app ban hang"
-  → Streamlit: POST /chat (hoặc orchestrator.invoke directly)
-  → FastAPI: _ensure_user() → orchestrator.invoke()
-  → supervisor: phát hiện CREATE_INTENT_KEYWORDS → "planner"
-  → planner: planner_agent()
-      → LLM tạo project plan (name, tasks, risks)
-      → db.create_project()
-      → Redis cache (30 min)
+Human PM → Dashboard UI (Quản lý Task)
+  → Điền form: name, description, start_date, end_date
+  → db.create_project() — trực tiếp, KHÔNG LLM
+  → Tạo tasks: title, priority, due_date, estimated_hours, parent_task_id
+  → db.create_tasks_batch() — trực tiếp
+  → Tạo subtask: chọn parent_task_id → task tree
+  → Thêm members: chọn user + role → db.create_project_member()
+```
+
+### Flow 2: AI Gợi ý Assignment (Task Divider)
+```
+User: "Gợi ý assignment cho project này"
+  → supervisor: detect "gợi ý" / "assign" / "phân công" → "task_divider"
   → task_divider: task_divider_agent()
-      → LLM chia task, gán người
-      → db.create_tasks_batch()
-      → db.create_task_assignments_batch()
+      → LLM phân tích tasks top-level (parent_task_id IS NULL)
+      → LLM phân tích skill_notes + workload từ DB
+      → Output: recommendations top-3 user/task (score, reason, workload)
       → Redis cache (20 min)
-  → risk_assessment: risk_agent()
-      → LLM phân tích rủi ro
-      → db.create_risks_batch()
-      → Redis cache (15 min)
-      → [nếu risk_score >= 7]: needs_human_approval = True
-  → Nếu cần approval:
-      → human_approval: chờ user Approve/Reject
-      → [approved] → reminder
-      → [rejected] → END
-  → Nếu không cần approval:
-      → reminder: kiểm tra deadline → Slack notification
+  → PM Review trong Dashboard subtab "Assignment Review"
+      → Approve 1 trong 3 gợi ý (hoặc chọn manual override)
+      → db.create_task_assignments_batch() — chỉ lưu khi PM approve
   → END
 ```
 
-### Flow 2: Theo Dõi Tiến Độ
+### Flow 3: Theo Dõi Tiến Độ (Hierarchical)
 ```
-User: "Cap nhat tien do du an"
-  → supervisor: detect "tiến độ" → "progress_tracker"
+User: "Cập nhật tiến độ dự án"
+  → supervisor: detect "tiến độ" / "progress" → "progress_tracker"
   → progress_tracker: progress_tracker_agent()
-      → db.calculate_project_progress() ( % task Done )
-      → db.update_project_progress()
-      → LLM tạo response
+      → db.get_tasks_by_project() → build task tree
+      → _calculate_hierarchical_progress():
+          leaf task: Done=100%, InProgress=50%, Todo=0%
+          parent task: average of children
+      → db.update_project_progress(overall%)
+      → LLM tạo response với tree context
+      → Response: overall %, leaf completed/overdue/blocked counts
   → reminder: reminder_agent()
-      → Kiểm tra deadline
+      → Kiểm tra deadline đa mốc
       → Slack notifications
   → END
 ```
 
-### Flow 3: Phân Tích Rủi Ro
+### Flow 4: Phân Tích Rủi Ro (Rule + LLM)
 ```
-User: "Phan tich rui ro"
-  → supervisor: detect "rủi ro" → "risk_assessment"
+User: "Phân tích rủi ro"
+  → supervisor: detect "rủi ro" / "risk" → "risk_assessment"
   → risk_assessment: risk_agent()
-      → LLM phân tích rủi ro
-      → db.create_risks_batch()
-      → [high risk] → human_approval → [approved] → reminder → END
-      → [low risk] → reminder → END
+      → Step 1: Rule-based detection
+          → Task overdue → risk_score=6 hoặc 9
+          → High workload (>5 tasks) → risk_score=7
+          → Progress thấp (<20%) → risk_score=7
+      → Step 2: LLM bổ sung rủi ro (không trùng lặp)
+      → Merge + dedup by title
+      → db.create_risks_batch() (max 10)
+      → Nếu risk_score >= 7: needs_human_approval = True
+  → Nếu cần approval:
+      → human_approval: Approve/Reject
+      → [approved] → reminder → END
+      → [rejected] → END
+  → Nếu không cần approval: reminder → END
 ```
 
-### Flow 4: Background Reminder (Job tự động)
+### Flow 5: Background Reminder (Job tự động)
 ```
   → ReminderJob.run_reminder() (mỗi 30 phút, daemon thread)
   → reminder_agent(project_id=None)
       → Load tất cả active projects
-      → Với mỗi project, load tasks
-      → Check due_date vs today
-      → 3 ngày → Slack: ⏰ normal
-      → 1 ngày → Slack: 🚨 urgent
-      → Quá hạn → Slack: ❌ overdue
+      → Với mỗi project, load tasks + task_assignments
+      → Build assignee map (task_id → assignee_name)
+      → Check due_date vs today:
+          7 ngày → 📋 Nhắc sớm
+          3 ngày → ⏰ Sắp đến hạn
+          1 ngày → 🚨 Gần hạn
+          Quá hạn → ❌ Overdue
+      → Slack message có: task name, assignee, deadline, days remaining
       → Push log vào Redis reminder_logs
 ```
 
-### Flow 5: Chat Khi Chưa Có Project
+### Flow 6: Chat Khi Chưa Có Project
 ```
-User: "Cho toi xem tien do" (không có project_id)
-  → supervisor: no project_id, no create intent
+User: "Làm gì đó" (không có project_id)
+  → supervisor: no project_id, không còn route tới planner
   → END
-  → Response: "Vui lòng chọn một project có sẵn ở sidebar Dashboard..."
+  → Response: "Vui lòng chọn project ở sidebar Dashboard hoặc tạo project mới từ Dashboard."
 ```
 
 ---
@@ -546,6 +567,7 @@ User: "Cho toi xem tien do" (không có project_id)
 | `project_scope` | str | "Theo user" hoặc "Tất cả" |
 | `dashboard_snapshot` | dict | Cache dữ liệu dashboard |
 | `dashboard_snapshot_project_id` | str | Project ID của snapshot |
+| `task_recommendations` | dict | AI recommendations cho assignment review |
 
 ### Sidebar
 - **User Selector:** Dropdown chọn user từ DB (hoặc fallback text input)
@@ -560,33 +582,51 @@ User: "Cho toi xem tien do" (không có project_id)
 - Chat input → `orchestrator.invoke()`
 - Xử lý `needs_human_approval` flag
 
-### Tab 2: Dashboard (`📊`)
+### Tab 2: Dashboard (`📊`) — 6 subtabs
 
 #### Subtabs:
 1. **📈 Tổng quan (Overview)**
    - 4 metrics: Tiến độ %, Tổng Task, Chưa hoàn thành, Quá hạn
    - Status summary: Todo / InProgress / Review / Done counts
-   - DataTable task list với assignees
+   - 🌳 **Task Tree** hierarchical display (parent → children nesting)
+   - DataTable task list với assignees + parent_task indicator
 
-2. **👥 Quản lý Team**
+2. **📋 Quản lý Task**
+   - **Tạo Project Form:** name, description, start_date, end_date → manual DB insert
+   - **Tạo Task Form:** title, description, priority, due_date, estimated_hours, parent_task_id
+   - **Tạo Subtask nhanh:** chọn parent task → form inline
+   - **Inline Status Update:** selectbox per task → db.update_task_status()
+   - **Delete Task:** nút xóa từng task
+   - Hiển thị danh sách tất cả tasks của project
+
+3. **👥 Quản lý Team**
    - Form tạo User mới (name, email, role, skill)
-   - Danh sách thành viên trong project (có nút xóa)
+   - **Thêm Member vào Project:** chọn user từ dropdown → db.create_project_member()
+   - Danh sách thành viên (có nút xóa)
    - Workload Summary table (member, role, capacity, tasks, hours)
 
-3. **⚠️ Rủi Ro**
+4. **⚠️ Rủi Ro**
    - 4 metrics: Tổng Risks, Open, Mitigating, Avg Score
    - Risk list với color coding (🔴 >=7, 🟠 >=4, 🟢 <4)
 
-4. **📊 System Monitoring**
+5. **✅ Assignment Review** (NEW)
+   - **🤖 Gợi ý Assignment** button → gọi AI Task Divider
+   - Hiển thị recommendations top-3/task với score và reason
+   - **Approve** gợi ý → lưu vào task_assignments
+   - **Manual override:** chọn user từ dropdown → gán
+   - **Manual Assign** cho tasks chưa assigned
+   - Hiển thị assignments hiện tại
+
+6. **📊 System Monitoring**
    - Redis Status (🟢/🔴)
-   - Cache statistics (keys count)
+   - Cache statistics (task_divider:* + risk:* keys)
    - Recent Reminder Logs
    - Cache management buttons (Clear All, View Keys, Refresh Metrics)
    - Orchestrator Event Log viewer (filter by event prefix)
    - Audit Timeline
 
 ### Dashboard Data Snapshot
-`_build_dashboard_snapshot(project_id)` — gọi 9 DB queries:
+`_build_dashboard_snapshot(project_id)` — gọi 10 DB queries:
 1. `get_project()`
 2. `get_tasks_by_project()`
 3. `get_project_members()`
@@ -608,8 +648,46 @@ User: "Cho toi xem tien do" (không có project_id)
 - **Request body:** `ChatRequest { user_input, user_id?, project_id? }`
 - **Logic:**
   - `_ensure_user()` — auto-tạo user nếu chưa tồn tại
-  - `orchestrator.invoke()` với thread config
+  - `orchestrator.invoke()` với thread config (current_phase="ready")
 - **Response:** `{ response, project_id, success }`
+
+### REST API — Project Management (PHASE 2)
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| `GET` | `/api/users` | Danh sách users |
+| `POST` | `/api/projects` | Tạo project mới (manual, không LLM) |
+| `GET` | `/api/projects` | Danh sách projects (filter by owner_id) |
+| `GET` | `/api/projects/{id}` | Chi tiết project |
+| `PUT` | `/api/projects/{id}` | Cập nhật project |
+| `DELETE` | `/api/projects/{id}` | Xóa project |
+| `POST` | `/api/projects/{id}/members` | Thêm member vào project |
+| `DELETE` | `/api/projects/{id}/members/{uid}` | Xóa member |
+| `GET` | `/api/projects/{id}/members` | Danh sách members |
+| `GET` | `/api/projects/{id}/workload` | Workload của members |
+
+### REST API — Task Management (PHASE 3)
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| `POST` | `/api/projects/{id}/tasks` | Tạo task mới |
+| `GET` | `/api/projects/{id}/tasks` | Danh sách tasks (flat) |
+| `GET` | `/api/projects/{id}/tasks/tree` | Task tree (hierarchical) |
+| `GET` | `/api/tasks/{id}` | Chi tiết task |
+| `PUT` | `/api/tasks/{id}` | Cập nhật task |
+| `DELETE` | `/api/tasks/{id}` | Xóa task |
+| `PUT` | `/api/tasks/{id}/status` | Cập nhật trạng thái task |
+| `POST` | `/api/tasks/{id}/subtasks` | Tạo subtask (gắn parent_task_id) |
+
+### REST API — Assignments & Risks (PHASE 3/4b/6)
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| `POST` | `/api/projects/{id}/assignments` | Lưu assignments (sau PM approve) |
+| `GET` | `/api/projects/{id}/assignments` | Lấy assignments |
+| `GET` | `/api/projects/{id}/risks` | Danh sách rủi ro |
+| `GET` | `/api/projects/{id}/risks/summary` | Tổng quan rủi ro |
+| `GET` | `/api/projects/{id}/progress` | Tiến độ project (progress% + summary + overdue) |
 
 ### `POST /start-reminder`
 - Start `ReminderJob.start_background(interval_seconds=1800)` (30 phút)
@@ -671,11 +749,12 @@ User: "Cho toi xem tien do" (không có project_id)
 ### Cache Strategy
 | Cache Key | TTL | Set by | Purpose |
 |-----------|-----|--------|---------|
-| `planner:{md5[:20]}` | 30 min | Planner Agent | Tránh gọi LLM cho cùng yêu cầu |
-| `task_divider:{project_id}` | 20 min | Task Divider | Tránh chia task lại cho project cũ |
+| `task_divider:{project_id}` | 20 min | Task Divider | Tránh gọi LLM lại cho cùng project |
 | `risk:{project_id}` | 15 min | Risk Agent | Tránh phân tích rủi ro lại |
 | `reminder_logs` | N/A (list) | Reminder Agent + ReminderJob | Log lịch sử reminder (max 100) |
 | `notification_logs` | N/A (list) | NotificationTools | Log lịch sử notification (max 100) |
+
+**Lưu ý:** `planner:{md5[:20]}` cache key đã bị xóa cùng Planner Agent.
 
 ### Methods
 - `set(key, value, expire=3600)` — JSON-serialized với TTL
@@ -707,11 +786,11 @@ User: "Cho toi xem tien do" (không có project_id)
 
 ### Log Events (prefix conventions)
 - `supervisor.enter / supervisor.exit / supervisor.route`
-- `planner.enter / planner.llm.response / planner.db.project_created / planner.cache.hit|save`
-- `task_divider.enter / task_divider.llm.response / task_divider.db.tasks_created`
-- `risk.enter / risk.llm.response / risk.db.risks_created / risk.cache.hit|save`
+- `task_divider.enter / task_divider.llm.response / task_divider.parse.fallback / task_divider.exception`
+- `risk.enter / risk.llm.response / risk.rule_based.detected / risk.db.risks_created / risk.cache.hit|save`
 - `progress.enter / progress.db.progress_updated / progress.llm.response`
-- `reminder.enter / reminder.tasks.loaded / reminder.exception`
+- `reminder.enter / reminder.tasks.loaded / reminder.notification.sent / reminder.exception`
+- `api.project.created|updated|deleted / api.task.created|updated|deleted / api.assignments.saved`
 - `redis.connect.success|failure / redis.set.success|failure`
 - `audit.write.enter|exit|exception`
 
@@ -761,10 +840,9 @@ User: "Cho toi xem tien do" (không có project_id)
 
 | File | Tests | Coverage |
 |------|-------|----------|
-| `test_chat_flow_routing.py` | 4 tests | Full flow routing, missing project, create intent, FastAPI endpoint |
 | `test_none_list_regression.py` | 1 test | Risk agent returns no risks (None-list edge case) |
-| `test_risk_agent_context.py` | 1 test | Risk agent uses planner context + datetime serialization |
-| `test_task_divider_serialization.py` | 1 test | Datetime serialization + assignment persistence |
+| `test_risk_agent_context.py` | 1 test | Risk agent uses project context + datetime serialization |
+| `test_task_divider_serialization.py` | 1 test | Task divider returns recommendations (no DB writes) |
 
 ### Testing Patterns
 
@@ -781,7 +859,6 @@ User: "Cho toi xem tien do" (không có project_id)
 
 ### Chưa có test cho:
 - Streamlit frontend (not tested)
-- `progress_tracker_agent`
 - `reminder_agent`
 - `ReminderJob`
 - DB update operations (`update_task_status`, `update_risk_status`)
@@ -871,15 +948,20 @@ pytest tests/ -v
 - **`normalize_agent_result()`** — xử lý cả dict và Pydantic model output
 - **`serialize_for_json()`** — dùng ở DB layer thay vì model layer
 - **Test stubs** trong `langgraph/` — cho phép chạy test không cần langgraph thật
+- **REST API endpoints** cho phép frontend gọi DB trực tiếp không qua LangGraph
 - **`FRONTEND/components/chat.py`** và **`dashboard.py`** — đang là placeholder, code chính vẫn trong `streamlit_app.py`
 
 ---
 
 ## 📈 Trạng Thái Dự Án (6/2026)
 
-- **Branch hiện tại:** `debug` (đã modify so với `main`)
-- **Modified files:** `.gitignore`, `README.md`, hầu hết agents, DB clients, orchestrator, frontend, logger
-- **New files:** `app/utils/serialization.py`, `tests/test_chat_flow_routing.py`, `tests/test_risk_agent_context.py`, `tests/test_task_divider_serialization.py`
+- **Branch hiện tại:** `refactor/remove-planner-agent`
+- **Kiến trúc mới:** Human tạo project/task thủ công, AI chỉ recommend/analyze/remind
+- **Trạng thái:** ✅ Phase 1-8 hoàn thành (xóa planner, phân tích rủi ro 2 lớp, progress phân cấp, reminder 4 mốc)
+- **Modified files:** Hầu hết agents, orchestrator, frontend (6 subtabs), main.py (REST API), tests
+- **New files:** `app/utils/serialization.py`, `app/prompts/task_divider_prompts.py`, `app/prompts/risk_prompts.py`
+- **Deleted files:** `planner_agent.py`, `planner_prompts.py`, `test_chat_flow_routing.py`
+- **All 3 tests pass:** test_none_list_regression, test_risk_agent_context, test_task_divider_serialization
 - **Hoạt động:** Backend + Frontend + Database + Redis đều kết nối được
 - **Cần cải thiện:**
   - Tách `streamlit_app.py` thành components riêng
