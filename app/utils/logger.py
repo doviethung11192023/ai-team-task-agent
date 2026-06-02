@@ -4,7 +4,6 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -75,12 +74,7 @@ def get_logger(name: str) -> logging.Logger:
         if os.getenv("APP_LOG_TO_FILE", "true").lower() == "true":
             log_dir = _project_root() / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
-            file_handler = RotatingFileHandler(
-                log_dir / "app.log",
-                maxBytes=1_000_000,
-                backupCount=5,
-                encoding="utf-8",
-            )
+            file_handler = logging.FileHandler(log_dir / "app.log", encoding="utf-8")
             file_handler.setFormatter(formatter)
             logger.addHandler(file_handler)
 

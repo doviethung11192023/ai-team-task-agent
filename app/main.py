@@ -6,6 +6,7 @@ from typing import Optional
 
 from app.graph.orchestrator import orchestrator
 from app.jobs.reminder_job import reminder_job
+from app.database.supabase_client import db
 from app.utils.helpers import build_graph_config
 app = FastAPI(
     title="AI Team Task Management Agent",
@@ -24,15 +25,30 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     user_input: str
-    user_id: str = "user-001"
+    user_id: Optional[str] = None
     project_id: Optional[str] = None
+
+
+def _ensure_user(user_id: str) -> str:
+    existing_user = db.get_user(user_id)
+    if existing_user:
+        return user_id
+
+    created_user = db.create_user({
+        "name": user_id,
+        "email": f"{user_id}@internal.local",
+        "role": "member",
+        "skill_notes": "Auto-created for chat runtime",
+    })
+    return str(created_user["user_id"])
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
     """Endpoint chính để chat với AI Agent"""
+    user_id = _ensure_user(request.user_id or "anonymous")
     inputs = {
         "user_input": request.user_input,
-        "user_id": request.user_id,
+        "user_id": user_id,
         "project_id": request.project_id,
         "messages": [],
         "tasks": [],
@@ -40,7 +56,7 @@ async def chat(request: ChatRequest):
         "current_phase": "planning"
     }
     
-    result = orchestrator.invoke(inputs,  config=build_graph_config(request.user_id, request.project_id))
+    result = orchestrator.invoke(inputs, config=build_graph_config(user_id))
     return {
         "response": result.get("messages", [])[-1].get("content") if result.get("messages") else "Đã xử lý",
         "project_id": result.get("project_id"),

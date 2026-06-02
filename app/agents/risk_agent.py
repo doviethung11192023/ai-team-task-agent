@@ -11,6 +11,7 @@ import hashlib
 from langsmith import traceable
 import time
 from app.utils.logger import get_logger, log_event, truncate_text, summarize_sequence
+from app.utils.serialization import serialize_for_json
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash", 
@@ -48,17 +49,19 @@ def risk_agent(project_id: str, project_data: dict = None, tasks: list = None) -
             return AgentResponse(**cached_result)
 
         # ==================== GỌI LLM ====================
-        project = project_data or db.get_project(project_id)
-        tasks = tasks or db.get_tasks_by_project(project_id)
+        project = serialize_for_json(project_data or db.get_project(project_id) or {})
+        tasks = serialize_for_json(tasks or (project_data or {}).get("tasks") or db.get_tasks_by_project(project_id) or [])
         log_event(logger, "risk.data.loaded", project_id=project_id, tasks_summary=summarize_sequence(tasks, sample_key="title"))
 
         prompt = f"""
         {RISK_SYSTEM_PROMPT}
 
         Thông tin Project:
-        Tên: {project.get('name')}
-        Mô tả: {project.get('description')}
+        Tên: {project.get('name') or project.get('project_name')}
+        Mô tả: {project.get('description') or project.get('project_description')}
         Deadline: {project.get('end_date')}
+        Kế hoạch dự án:
+        {json.dumps(project, ensure_ascii=False, indent=2)}
 
         Danh sách Tasks ({len(tasks)} tasks):
         {json.dumps(tasks, ensure_ascii=False, indent=2)}

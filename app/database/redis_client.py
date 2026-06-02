@@ -4,6 +4,7 @@ import json
 from typing import Any, Optional
 from config import config
 from app.utils.logger import get_logger, log_event
+from app.utils.serialization import serialize_for_json
 
 
 logger = get_logger("app.database.redis_client")
@@ -48,7 +49,7 @@ class RedisClient:
             log_event(logger, "redis.set.skip", level="debug", key=key, reason="client_unavailable")
             return False
         try:
-            self.client.set(key, json.dumps(value), ex=expire)
+            self.client.set(key, json.dumps(serialize_for_json(value), ensure_ascii=False), ex=expire)
             log_event(logger, "redis.set.success", level="debug", key=key, expire=expire)
             return True
         except Exception as e:

@@ -99,6 +99,7 @@ traces/
 tmp/
 temp/
 .cache/
+_debug_orch.py
 
 # =========================
 # Node.js (nếu có frontend)

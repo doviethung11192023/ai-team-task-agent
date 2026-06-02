@@ -10,7 +10,9 @@ import json
 import hashlib
 from langsmith import traceable
 import time
+from datetime import date, timedelta
 from app.utils.logger import get_logger, log_event, truncate_text, summarize_sequence
+from app.utils.serialization import serialize_for_json
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash", 
@@ -19,6 +21,40 @@ llm = ChatGoogleGenerativeAI(
 )
 
 logger = get_logger("app.agents.task_divider")
+
+
+def _resolve_assignee_user_id(assigned_to: object, team_members: list[dict] | None) -> str | None:
+    if not assigned_to:
+        return None
+
+    normalized_value = str(assigned_to).strip().lower()
+    for member in team_members or []:
+        user_id = str(member.get("user_id") or "").strip().lower()
+        name = str(member.get("name") or "").strip().lower()
+        email = str(member.get("email") or "").strip().lower()
+        if normalized_value in {user_id, name, email}:
+            return member.get("user_id")
+    return None
+
+
+def _resolve_due_date(task: dict) -> date:
+    due_date = task.get("due_date")
+    if due_date:
+        if isinstance(due_date, date):
+            return due_date
+        try:
+            return date.fromisoformat(str(due_date))
+        except ValueError:
+            pass
+
+    due_date_offset = task.get("due_date_offset")
+    if due_date_offset is not None:
+        try:
+            return date.today() + timedelta(days=int(due_date_offset))
+        except (TypeError, ValueError):
+            pass
+
+    return date.today()
 
 @traceable(name="Task Divider Agent")
 def task_divider_agent(project_id: str, project_data: dict = None, raw_tasks: list = None) -> AgentResponse:
@@ -49,13 +85,13 @@ def task_divider_agent(project_id: str, project_data: dict = None, raw_tasks: li
         {TASK_DIVIDER_SYSTEM_PROMPT}
 
         Thông tin Project:
-        {json.dumps(project_data or {}, ensure_ascii=False, indent=2)}
+        {json.dumps(serialize_for_json(project_data or {}), ensure_ascii=False, indent=2)}
 
         Danh sách task thô:
-        {json.dumps(raw_tasks or [], ensure_ascii=False, indent=2)}
+        {json.dumps(serialize_for_json(raw_tasks or []), ensure_ascii=False, indent=2)}
 
         Danh sách thành viên:
-        {json.dumps(team_members, ensure_ascii=False, indent=2)}
+        {json.dumps(serialize_for_json(team_members), ensure_ascii=False, indent=2)}
         """
 
         messages = [
@@ -78,24 +114,98 @@ def task_divider_agent(project_id: str, project_data: dict = None, raw_tasks: li
             log_event(logger, "task_divider.parse.fallback", level="warning", project_id=project_id)
 
         # Lưu tasks vào database
+        created_tasks = []
+        assigned_tasks = []
         if result.get("assigned_tasks"):
             tasks_to_create = []
             for task in result["assigned_tasks"][:12]:  # Giới hạn
+                assigned_user_id = _resolve_assignee_user_id(task.get("assigned_to"), team_members)
                 tasks_to_create.append({
                     "project_id": project_id,
                     "title": task.get("task_title"),
                     "description": task.get("description", "Auto generated"),
-                    "due_date": "2026-07-15",  # Có thể tinh chỉnh sau
+                    "due_date": _resolve_due_date(task),
                     "priority": task.get("priority", "Medium"),
                     "status": "Todo"
                 })
+                assigned_tasks.append({
+                    "task_title": task.get("task_title"),
+                    "assigned_to": task.get("assigned_to"),
+                    "assigned_user_id": assigned_user_id,
+                    "reason": task.get("reason"),
+                    "description": task.get("description", "Auto generated"),
+                    "priority": task.get("priority", "Medium"),
+                    "due_date": _resolve_due_date(task).isoformat(),
+                })
             if tasks_to_create:
-                db.create_tasks_batch(tasks_to_create)
+                created_tasks = db.create_tasks_batch(tasks_to_create)
                 log_event(logger, "task_divider.db.tasks_created", project_id=project_id, tasks_to_create_count=len(tasks_to_create))
+                task_assignments = []
+                for created_task, assigned_task in zip(created_tasks, assigned_tasks):
+                    assigned_user_id = assigned_task.get("assigned_user_id")
+                    if not assigned_user_id:
+                        continue
+                    task_assignments.append({
+                        "task_id": created_task.get("task_id"),
+                        "user_id": assigned_user_id,
+                        "assigned_by": None,
+                    })
+
+                if task_assignments:
+                    # Ensure assigned users are members of the project; create missing project_members
+                    existing_members = {m.get("user_id") for m in db.get_project_members(project_id) or []}
+                    new_members_created = []
+                    for ta in task_assignments:
+                        uid = ta.get("user_id")
+                        if uid and uid not in existing_members:
+                            try:
+                                db.create_project_member(project_id, uid, role_in_project="Member", workload_capacity=100)
+                                existing_members.add(uid)
+                                new_members_created.append(uid)
+                            except Exception as e:
+                                log_event(
+                                    logger,
+                                    "task_divider.project_member.create.error",
+                                    level="warning",
+                                    project_id=project_id,
+                                    user_id=uid,
+                                    error_type=type(e).__name__,
+                                    error=str(e),
+                                )
+
+                    if new_members_created:
+                        log_event(
+                            logger,
+                            "task_divider.project_member.created",
+                            project_id=project_id,
+                            created_count=len(new_members_created),
+                            user_ids=new_members_created,
+                        )
+                    db.create_task_assignments_batch(task_assignments)
+                    log_event(
+                        logger,
+                        "task_divider.db.task_assignments_created",
+                        project_id=project_id,
+                        task_assignments_count=len(task_assignments),
+                    )
+                elif created_tasks:
+                    log_event(
+                        logger,
+                        "task_divider.db.task_assignments_skipped",
+                        level="warning",
+                        project_id=project_id,
+                        reason="no_resolved_assignee",
+                    )
 
         final_result = AgentResponse(
             response=f"✅ Đã phân chia {len(result.get('assigned_tasks', []))} tasks cho team.",
-            tasks=result.get("assigned_tasks", []),
+            tasks=[
+                {
+                    **created_task,
+                    **assigned_task,
+                }
+                for created_task, assigned_task in zip(created_tasks, assigned_tasks)
+            ] or assigned_tasks,
             success=True
         ).dict()
 

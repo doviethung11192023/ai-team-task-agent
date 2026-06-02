@@ -2,15 +2,19 @@
 from app.utils.slack_client import send_slack_notification
 from app.database.redis_client import redis_client
 from datetime import datetime
-from langsmith import traceable
+import os
 
-@traceable(name="Notification Tools")
+
 class NotificationTools:
     
     @staticmethod
     def send_notification(message: str, channel: str = None) -> bool:
         """Gửi thông báo qua Slack"""
-        success = send_slack_notification(message)
+        # During tests, avoid making external network calls to Slack.
+        if os.getenv("PYTEST_CURRENT_TEST") is not None or os.getenv("ENV") == "test":
+            success = False
+        else:
+            success = send_slack_notification(message)
         if success:
             # Lưu log vào Redis
             log = {

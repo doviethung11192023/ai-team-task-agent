@@ -44,6 +44,8 @@ class StateGraph:
 
                 current = self.entry
                 # run until END or no next_step
+                visits: dict[str, int] = {}
+                MAX_VISITS = 50
                 while current and current != END:
                     node = self.nodes.get(current)
                     if not node:
@@ -53,6 +55,13 @@ class StateGraph:
                     except Exception:
                         # swallow node errors in test stub
                         state.setdefault('error', 'node_error')
+
+                    # track visits to prevent infinite loops in tests
+                    visits[current] = visits.get(current, 0) + 1
+                    if visits[current] > MAX_VISITS:
+                        state.setdefault('error', f'visit_limit_exceeded:{current}')
+                        break
+
                     nxt = state.get('next_step')
                     if not nxt or nxt == END:
                         break

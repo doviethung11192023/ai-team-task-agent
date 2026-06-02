@@ -1,6 +1,7 @@
 # app/jobs/reminder_job.py
 from app.agents.reminder_agent import reminder_agent
 from app.database.redis_client import redis_client
+from app.utils.serialization import serialize_for_json
 import time
 import json
 from datetime import datetime
@@ -25,15 +26,19 @@ class ReminderJob:
             }
             
             # Push vào Redis List (Queue)
-            redis_client.client.lpush("reminder_logs", json.dumps(log_entry))
+            if redis_client.client:
+                redis_client.client.lpush("reminder_logs", json.dumps(serialize_for_json(log_entry), ensure_ascii=False))
+            else:
+                print(f"[{datetime.now()}] WARNING: Redis client unavailable, skipping reminder log push")
             
             # Giữ tối đa 100 logs
-            redis_client.client.ltrim("reminder_logs", 0, 99)
+            if redis_client.client:
+                redis_client.client.ltrim("reminder_logs", 0, 99)
             
-            print(f"[{datetime.now()}] ✅ Reminder Job executed")
+            print(f"[{datetime.now()}] Reminder Job executed")
             
         except Exception as e:
-            print(f"[{datetime.now()}] ❌ Reminder Job error: {e}")
+            print(f"[{datetime.now()}] Reminder Job error: {e}")
 
     def start_background(self, interval_seconds=3600):
         """Chạy background job định kỳ"""
@@ -46,7 +51,7 @@ class ReminderJob:
         def run_schedule():
             schedule.every(interval_seconds).seconds.do(self.run_reminder)
             
-            print(f"🚀 Background Reminder Job started - Check every {interval_seconds} seconds")
+            print(f"Background Reminder Job started - Check every {interval_seconds} seconds")
             
             while self.is_running:
                 schedule.run_pending()
@@ -58,7 +63,7 @@ class ReminderJob:
     def stop(self):
         """Dừng job"""
         self.is_running = False
-        print("⛔ Background Reminder Job stopped")
+        print("Background Reminder Job stopped")
 
 
 # Singleton

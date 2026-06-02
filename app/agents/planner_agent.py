@@ -21,7 +21,7 @@ llm = ChatGoogleGenerativeAI(
 logger = get_logger("app.agents.planner_agent")
 
 @traceable(name="Planner Agent", run_type="chain")
-def planner_agent(user_input: str, team_members: list = None) -> AgentResponse:
+def planner_agent(user_input: str, user_id: str, team_members: list = None) -> AgentResponse:
     """
     Planner Agent với Redis Caching
     """
@@ -34,6 +34,7 @@ def planner_agent(user_input: str, team_members: list = None) -> AgentResponse:
             "planner.enter",
             cache_key=cache_key,
             user_input_preview=truncate_text(user_input, 180),
+            user_id=user_id,
             team_members_summary=summarize_sequence(team_members, sample_key="name"),
         )
         
@@ -78,7 +79,7 @@ def planner_agent(user_input: str, team_members: list = None) -> AgentResponse:
             "description": plan.get("project_description", user_input),
             "start_date": None,
             "end_date": None,
-            "owner_id": "00000000-0000-0000-0000-000000000000",
+            "owner_id": user_id,
             "status": "Planning"
         }
         

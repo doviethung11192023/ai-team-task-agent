@@ -3,6 +3,8 @@ from config import config
 from typing import List, Dict, Optional, Any, Iterable
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
+from psycopg2 import extensions
+from app.utils.serialization import serialize_for_json
 
 class SupabaseDB:
     def __init__(self):
@@ -17,9 +19,9 @@ class SupabaseDB:
                 password=config.DB_PASSWORD,
                 sslmode=config.DB_SSLMODE
             )
-            print("✅ Direct PostgreSQL Connection established")
+            print("Direct PostgreSQL connection established")
         except Exception as e:
-            print(f"⚠️ Không thể kết nối direct PostgreSQL: {e}")
+            print(f"WARNING: could not connect to direct PostgreSQL: {e}")
             self.conn = None
 
     def _ensure_connection(self):
@@ -32,13 +34,31 @@ class SupabaseDB:
                 password=config.DB_PASSWORD,
                 sslmode=config.DB_SSLMODE,
             )
+        elif self.conn.status != extensions.STATUS_READY:
+            try:
+                self.conn.rollback()
+            except Exception:
+                self.conn.close()
+                self.conn = psycopg2.connect(
+                    host=config.DB_HOST,
+                    port=config.DB_PORT,
+                    database=config.DB_NAME,
+                    user=config.DB_USER,
+                    password=config.DB_PASSWORD,
+                    sslmode=config.DB_SSLMODE,
+                )
 
     def _fetchall(self, query: str, params: Optional[tuple] = None) -> List[Dict]:
         self._ensure_connection()
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute(query, params or ())
-            rows = cursor.fetchall()
-        return [dict(row) for row in rows]
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(query, params or ())
+                rows = cursor.fetchall()
+            return [serialize_for_json(dict(row)) for row in rows]
+        except Exception:
+            if self.conn:
+                self.conn.rollback()
+            raise
 
     def _fetchone(self, query: str, params: Optional[tuple] = None) -> Optional[Dict]:
         rows = self._fetchall(query, params)
@@ -46,11 +66,16 @@ class SupabaseDB:
 
     def _execute(self, query: str, params: Optional[tuple] = None, fetch: bool = False):
         self._ensure_connection()
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute(query, params or ())
-            result = cursor.fetchall() if fetch else None
-        self.conn.commit()
-        return [dict(row) for row in result] if result else []
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(query, params or ())
+                result = cursor.fetchall() if fetch else None
+            self.conn.commit()
+            return [serialize_for_json(dict(row)) for row in result] if result else []
+        except Exception:
+            if self.conn:
+                self.conn.rollback()
+            raise
 
     # ====================== USERS / PROJECTS / TASKS / RISKS ======================
     def get_users(self) -> List[Dict]:
@@ -68,6 +93,24 @@ class SupabaseDB:
             FROM users
             ORDER BY created_at DESC
             """
+        )
+
+    def get_user(self, user_id: str) -> Optional[Dict]:
+        return self._fetchone(
+            """
+            SELECT
+                user_id::text,
+                name,
+                email,
+                role,
+                avatar_url,
+                skill_notes,
+                created_at,
+                updated_at
+            FROM users
+            WHERE user_id = %s
+            """,
+            (user_id,),
         )
 
     def create_user(self, user_data: Dict) -> Dict:
@@ -105,6 +148,27 @@ class SupabaseDB:
             FROM projects
             ORDER BY created_at DESC
             """
+        )
+
+    def get_projects_by_owner(self, owner_id: str) -> List[Dict]:
+        return self._fetchall(
+            """
+            SELECT
+                project_id::text,
+                name,
+                description,
+                start_date,
+                end_date,
+                status,
+                owner_id::text,
+                progress_percentage,
+                created_at,
+                updated_at
+            FROM projects
+            WHERE owner_id = %s
+            ORDER BY updated_at DESC
+            """,
+            (owner_id,),
         )
 
     def create_project(self, project_data: Dict) -> Dict:
@@ -225,7 +289,7 @@ class SupabaseDB:
                             task.get("parent_task_id"),
                         ),
                     )
-                    inserted_rows.append(dict(cursor.fetchone()))
+                    inserted_rows.append(serialize_for_json(dict(cursor.fetchone())))
             self.conn.commit()
         except Exception:
             self.conn.rollback()
@@ -291,13 +355,204 @@ class SupabaseDB:
                             risk.get("contingency_plan"),
                         ),
                     )
-                    inserted.append(dict(cursor.fetchone()))
+                    inserted.append(serialize_for_json(dict(cursor.fetchone())))
             self.conn.commit()
         except Exception:
             self.conn.rollback()
             raise
 
         return inserted
+
+    def create_task_assignments_batch(self, assignments: List[Dict]) -> List[Dict]:
+        if not assignments:
+            return []
+
+        self._ensure_connection()
+        try:
+            inserted: List[Dict] = []
+            query = """
+                INSERT INTO task_assignments (
+                    task_id, user_id, assigned_by
+                )
+                VALUES (%s, %s, %s)
+                RETURNING
+                    assignment_id::text,
+                    task_id::text,
+                    user_id::text,
+                    assigned_at,
+                    assigned_by::text
+            """
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                for assignment in assignments:
+                    cursor.execute(
+                        query,
+                        (
+                            assignment.get("task_id"),
+                            assignment.get("user_id"),
+                            assignment.get("assigned_by"),
+                        ),
+                    )
+                    inserted.append(serialize_for_json(dict(cursor.fetchone())))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+        return inserted
+
+    def get_task_assignments_by_project(self, project_id: str) -> List[Dict]:
+        return self._fetchall(
+            """
+            SELECT
+                ta.assignment_id::text,
+                ta.task_id::text,
+                ta.user_id::text,
+                ta.assigned_at,
+                ta.assigned_by::text,
+                u.name AS assignee_name,
+                u.email AS assignee_email,
+                t.title AS task_title,
+                t.status AS task_status,
+                t.priority AS task_priority,
+                t.due_date
+            FROM task_assignments ta
+            JOIN tasks t ON t.task_id = ta.task_id
+            JOIN users u ON u.user_id = ta.user_id
+            WHERE t.project_id = %s
+            ORDER BY ta.assigned_at DESC
+            """,
+            (project_id,),
+        )
+
+    def get_task_status_summary(self, project_id: str) -> Dict[str, int]:
+        rows = self._fetchall(
+            """
+            SELECT status, COUNT(*)::int AS count
+            FROM tasks
+            WHERE project_id = %s
+            GROUP BY status
+            """,
+            (project_id,),
+        )
+        summary = {"Todo": 0, "InProgress": 0, "Review": 0, "Done": 0}
+        for row in rows:
+            status = row.get("status")
+            count = row.get("count", 0)
+            if status:
+                summary[status] = int(count)
+        return summary
+
+    def get_overdue_tasks(self, project_id: str) -> List[Dict]:
+        return self._fetchall(
+            """
+            SELECT
+                task_id::text,
+                project_id::text,
+                title,
+                description,
+                status,
+                priority,
+                estimated_hours,
+                actual_hours,
+                start_date,
+                due_date,
+                parent_task_id::text,
+                created_at,
+                updated_at
+            FROM tasks
+            WHERE project_id = %s
+              AND due_date < CURRENT_DATE
+              AND status <> 'Done'
+            ORDER BY due_date ASC
+            """,
+            (project_id,),
+        )
+
+    def get_risk_summary(self, project_id: str) -> Dict:
+        rows = self._fetchall(
+            """
+            SELECT
+                COUNT(*)::int AS total_risks,
+                COUNT(CASE WHEN status = 'Open' THEN 1 END)::int AS open_risks,
+                COUNT(CASE WHEN status = 'Mitigating' THEN 1 END)::int AS mitigating_risks,
+                COUNT(CASE WHEN status = 'Closed' THEN 1 END)::int AS closed_risks,
+                COALESCE(AVG(risk_score)::numeric, 0) AS avg_risk_score,
+                COALESCE(MAX(risk_score), 0) AS max_risk_score
+            FROM risks
+            WHERE project_id = %s
+            """,
+            (project_id,),
+        )
+        return rows[0] if rows else {
+            "total_risks": 0,
+            "open_risks": 0,
+            "mitigating_risks": 0,
+            "closed_risks": 0,
+            "avg_risk_score": 0,
+            "max_risk_score": 0,
+        }
+
+    def get_audit_logs(self, project_id: Optional[str] = None, limit: int = 100) -> List[Dict]:
+        if project_id:
+            return self._fetchall(
+                """
+                SELECT
+                    log_id::text,
+                    action,
+                    entity_type,
+                    entity_id::text,
+                    performed_by::text,
+                    details,
+                    created_at
+                FROM audit_logs
+                WHERE entity_id::text = %s
+                   OR details ->> 'project_id' = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (project_id, project_id, limit),
+            )
+
+        return self._fetchall(
+            """
+            SELECT
+                log_id::text,
+                action,
+                entity_type,
+                entity_id::text,
+                performed_by::text,
+                details,
+                created_at
+            FROM audit_logs
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+
+    def get_member_workload(self, project_id: str) -> List[Dict]:
+        return self._fetchall(
+            """
+            SELECT
+                pm.user_id::text,
+                u.name,
+                pm.role_in_project,
+                pm.workload_capacity,
+                COUNT(DISTINCT ta.assignment_id)::int AS assigned_task_count,
+                COALESCE(SUM(t.estimated_hours), 0) AS total_estimated_hours,
+                COALESCE(SUM(t.actual_hours), 0) AS total_actual_hours
+            FROM project_members pm
+            JOIN users u ON u.user_id = pm.user_id
+            LEFT JOIN task_assignments ta ON ta.user_id = pm.user_id
+            LEFT JOIN tasks t
+                ON t.task_id = ta.task_id
+               AND t.project_id = pm.project_id
+            WHERE pm.project_id = %s
+            GROUP BY pm.user_id, u.name, pm.role_in_project, pm.workload_capacity
+            ORDER BY u.name ASC
+            """,
+            (project_id,),
+        )
 
     def get_risks_by_project(self, project_id: str) -> List[Dict]:
         return self._fetchall(

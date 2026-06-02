@@ -1,7 +1,6 @@
 from typing import TypedDict, Annotated, List, Optional
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
-import operator
 import time
 
 from ..models.schemas import ProjectState
@@ -14,14 +13,37 @@ import os
 from langsmith import traceable
 
 HIGH_RISK_THRESHOLD = 7
+MAX_MESSAGE_HISTORY = 20
 
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
-os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
-os.environ["LANGCHAIN_API_KEY"] = config.LANGSMITH_API_KEY
-os.environ["LANGCHAIN_PROJECT"] = config.LANGSMITH_PROJECT
+# LangSmith tracing environment variables are set only when enabled in config
+# to avoid external network calls during tests or local runs.
 
 
 logger = get_logger("app.graph.orchestrator")
+
+
+CREATE_INTENT_KEYWORDS = (
+    "tạo project",
+    "tao project",
+    "tạo dự án",
+    "tao du an",
+    "dự án mới",
+    "du an moi",
+    "project mới",
+    "project moi",
+    "new project",
+    "create project",
+    "start project",
+    "khởi tạo",
+    "khoi tao",
+    "lập project",
+    "lap project",
+)
+
+
+def is_create_project_intent(user_input: str) -> bool:
+    normalized_input = (user_input or "").lower()
+    return any(keyword in normalized_input for keyword in CREATE_INTENT_KEYWORDS)
 
 
 def normalize_agent_result(result):
@@ -34,6 +56,24 @@ def normalize_agent_result(result):
         return result.dict()
     return {"response": str(result)}
 
+
+def merge_messages(existing: Optional[List[dict]], new: Optional[List[dict]]) -> List[dict]:
+    existing_messages = list(existing or [])
+    new_messages = list(new or [])
+
+    if not existing_messages:
+        combined = new_messages
+    elif not new_messages:
+        combined = existing_messages
+    elif len(new_messages) >= len(existing_messages) and new_messages[: len(existing_messages)] == existing_messages:
+        combined = new_messages
+    elif len(existing_messages) >= len(new_messages) and existing_messages[: len(new_messages)] == new_messages:
+        combined = existing_messages
+    else:
+        combined = existing_messages + new_messages
+
+    return combined[-MAX_MESSAGE_HISTORY:]
+
 # ====================== STATE DEFINITION ======================
 class AgentState(TypedDict):
     """State chính của LangGraph - Đây là "bộ nhớ" của hệ thống"""
@@ -42,7 +82,7 @@ class AgentState(TypedDict):
     project_id: Optional[str]
     
     # Messages & History
-    messages: Annotated[List[dict], operator.add]
+    messages: Annotated[List[dict], merge_messages]
     
     # Project Data
     project_data: Optional[dict]
@@ -74,16 +114,41 @@ def supervisor_node(state: AgentState) -> AgentState:
     )
 
     route_reason = "default"
+    if state.get("needs_human_approval") and state.get("approval_response") not in {"approved", "rejected"}:
+        state["next_step"] = "human_approval"
+        route_reason = "approval_pending"
+        log_event(logger, "supervisor.route", decision=state["next_step"], reason=route_reason, state=summarize_graph_state(state))
+        log_event(logger, "supervisor.exit", elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2), state=summarize_graph_state(state))
+        return state
+
     if state.get("approval_response") in {"approved", "rejected"}:
         state["next_step"] = "human_approval"
         route_reason = "approval_response"
         log_event(logger, "supervisor.route", decision=state["next_step"], reason=route_reason, state=summarize_graph_state(state))
         log_event(logger, "supervisor.exit", elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2), state=summarize_graph_state(state))
         return state
-    
+
     user_input = state["user_input"].lower()
+
+    if not state.get("project_id"):
+        if is_create_project_intent(user_input):
+            state["next_step"] = "planner"
+            route_reason = "planner_forced_null_project_id_create_intent"
+        else:
+            state["next_step"] = "end"
+            state["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": "Vui lòng chọn một project có sẵn ở sidebar Dashboard hoặc yêu cầu tạo project mới.",
+                }
+            )
+            route_reason = "missing_project_id_require_dashboard_selection"
+
+        log_event(logger, "supervisor.route", decision=state["next_step"], reason=route_reason, state=summarize_graph_state(state))
+        log_event(logger, "supervisor.exit", elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2), state=summarize_graph_state(state))
+        return state
     
-    if "tạo project" in user_input or "create project" in user_input:
+    if is_create_project_intent(user_input):
         state["current_phase"] = "planning"
         state["next_step"] = "planner"
         route_reason = "create_project_keyword"
@@ -113,10 +178,12 @@ def planner_node(state: AgentState) -> AgentState:
     from app.agents.planner_agent import planner_agent
     started_at = time.perf_counter()
     log_event(logger, "planner_node.enter", state=summarize_graph_state(state))
-    result = normalize_agent_result(planner_agent(state["user_input"], state.get("project_data")))
+    result = normalize_agent_result(planner_agent(state["user_input"], state["user_id"], state.get("project_data")))
     state["messages"].append({"role": "assistant", "content": result["response"]})
-    state["project_data"] = result.get("project_data")
+    state["project_data"] = result.get("project_data") or {}
     state["project_id"] = result.get("project_id")
+    state["tasks"] = (state.get("project_data") or {}).get("tasks") or []
+    state["risks"] = (state.get("project_data") or {}).get("initial_risks") or state.get("risks", [])
     
     log_audit("create_project", "Project", state.get("project_id"), state["user_id"], result)
     log_event(
@@ -135,6 +202,11 @@ def task_divider_node(state: AgentState) -> AgentState:
     from app.agents.task_divider import task_divider_agent
     started_at = time.perf_counter()
     log_event(logger, "task_divider_node.enter", state=summarize_graph_state(state))
+    if not state.get("project_id"):
+        message = "Chưa có project_id, bỏ qua task divider để tránh lỗi DB."
+        state["messages"].append({"role": "assistant", "content": message})
+        log_event(logger, "task_divider_node.skip", level="warning", reason="missing_project_id", state=summarize_graph_state(state))
+        return state
     result = normalize_agent_result(task_divider_agent(
         state["project_id"], 
         state["project_data"], 
@@ -157,6 +229,11 @@ def progress_tracker_node(state: AgentState) -> AgentState:
     from app.agents.progress_tracker import progress_tracker_agent
     started_at = time.perf_counter()
     log_event(logger, "progress_tracker_node.enter", state=summarize_graph_state(state))
+    if not state.get("project_id"):
+        message = "Chưa có project_id, bỏ qua progress tracker để tránh lỗi DB."
+        state["messages"].append({"role": "assistant", "content": message})
+        log_event(logger, "progress_tracker_node.skip", level="warning", reason="missing_project_id", state=summarize_graph_state(state))
+        return state
     result = normalize_agent_result(progress_tracker_agent(state["project_id"], state.get("user_input")))
     state["messages"].append({"role": "assistant", "content": result["response"]})
     log_event(
@@ -174,6 +251,11 @@ def risk_assessment_node(state: AgentState) -> AgentState:
     from app.agents.risk_agent import risk_agent
     started_at = time.perf_counter()
     log_event(logger, "risk_assessment_node.enter", state=summarize_graph_state(state))
+    if not state.get("project_id"):
+        message = "Chưa có project_id, bỏ qua risk assessment để tránh lỗi DB."
+        state["messages"].append({"role": "assistant", "content": message})
+        log_event(logger, "risk_assessment_node.skip", level="warning", reason="missing_project_id", state=summarize_graph_state(state))
+        return state
     result = normalize_agent_result(risk_agent(state["project_id"], state.get("project_data"), state.get("tasks")))
     state["risks"] = result.get("risks") or []
     state["needs_human_approval"] = any(risk_requires_approval(risk) for risk in (state["risks"] or []))
@@ -196,6 +278,14 @@ def reminder_node(state: AgentState) -> AgentState:
     from app.agents.reminder_agent import reminder_agent
     started_at = time.perf_counter()
     log_event(logger, "reminder_node.enter", state=summarize_graph_state(state))
+    # Prevent repeated re-entry to this node within the same invoke
+    visited = state.get("_visited_nodes") or []
+    if "reminder" in visited:
+        log_event(logger, "reminder_node.already_visited", state=summarize_graph_state(state))
+        state["next_step"] = "end"
+        return state
+    visited.append("reminder")
+    state["_visited_nodes"] = visited
     result = normalize_agent_result(reminder_agent(state.get("project_id")))
     state["messages"].append({"role": "assistant", "content": result["response"]})
     log_event(
@@ -205,6 +295,8 @@ def reminder_node(state: AgentState) -> AgentState:
         response_preview=truncate_text(result.get("response"), 180),
         state=summarize_graph_state(state),
     )
+    # Ensure we don't loop back into reminder repeatedly
+    state["next_step"] = "end"
     return state
 
 
@@ -259,6 +351,11 @@ def risk_requires_approval(risk: dict) -> bool:
 def route_next(state: AgentState) -> str:
     """Routing logic"""
     next_step = state.get("next_step")
+
+    if state.get("needs_human_approval") and state.get("approval_response") not in {"approved", "rejected"}:
+        decision = "human_approval"
+        log_event(logger, "route_next", decision=decision, state=summarize_graph_state(state))
+        return decision
     
     if next_step == "planner":
         decision = "planner"
@@ -270,6 +367,8 @@ def route_next(state: AgentState) -> str:
         decision = "risk_assessment"
     elif next_step == "human_approval":
         decision = "human_approval"
+    elif next_step == "end":
+        decision = END
     else:
         decision = END
 
@@ -354,8 +453,16 @@ def build_graph():
     )
     workflow.add_edge("reminder", END)
     
-    # Memory
-    memory = MemorySaver()
+    # Initialize optional tracing/checkpointer only when configured to avoid
+    # network calls during unit tests or local runs without LangSmith enabled.
+    memory = None
+    if getattr(config, "LANGSMITH_TRACING", False):
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
+        os.environ["LANGCHAIN_API_KEY"] = config.LANGSMITH_API_KEY or ""
+        os.environ["LANGCHAIN_PROJECT"] = config.LANGSMITH_PROJECT or ""
+        memory = MemorySaver()
+
     app = workflow.compile(checkpointer=memory)
     
     return app
