@@ -4,8 +4,6 @@ from langgraph.checkpoint.memory import MemorySaver
 import time
 
 from ..models.schemas import ProjectState
-# Agents are imported lazily inside node functions to avoid heavy import-time dependencies
-from ..tools.task_tools import create_project_tool
 from ..utils.helpers import log_audit
 from ..utils.logger import get_logger, log_event, summarize_graph_state, truncate_text, summarize_sequence
 from config import config
@@ -15,35 +13,7 @@ from langsmith import traceable
 HIGH_RISK_THRESHOLD = 7
 MAX_MESSAGE_HISTORY = 20
 
-# LangSmith tracing environment variables are set only when enabled in config
-# to avoid external network calls during tests or local runs.
-
-
 logger = get_logger("app.graph.orchestrator")
-
-
-CREATE_INTENT_KEYWORDS = (
-    "tạo project",
-    "tao project",
-    "tạo dự án",
-    "tao du an",
-    "dự án mới",
-    "du an moi",
-    "project mới",
-    "project moi",
-    "new project",
-    "create project",
-    "start project",
-    "khởi tạo",
-    "khoi tao",
-    "lập project",
-    "lap project",
-)
-
-
-def is_create_project_intent(user_input: str) -> bool:
-    normalized_input = (user_input or "").lower()
-    return any(keyword in normalized_input for keyword in CREATE_INTENT_KEYWORDS)
 
 
 def normalize_agent_result(result):
@@ -80,29 +50,29 @@ class AgentState(TypedDict):
     user_input: str
     user_id: str
     project_id: Optional[str]
-    
+
     # Messages & History
     messages: Annotated[List[dict], merge_messages]
-    
+
     # Project Data
     project_data: Optional[dict]
     tasks: List[dict]
     risks: List[dict]
-    
+
     # Control Flow
     next_step: str
     needs_human_approval: bool
     approval_response: Optional[str]  # "approved" or "rejected"
-    
+
     # Status
-    current_phase: str  # planning, risk_assessment, execution, monitoring
+    current_phase: str  # ready, risk_assessment, execution, monitoring
     error: Optional[str]
 
 
 # ====================== NODES (Các Agent/Function) ======================
 
 def supervisor_node(state: AgentState) -> AgentState:
-    """Orchestrator - Quyết định bước tiếp theo"""
+    """Orchestrator - Quyết định bước tiếp theo (REFACTORED: đã xóa planner)"""
     started_at = time.perf_counter()
     log_event(
         logger,
@@ -130,87 +100,73 @@ def supervisor_node(state: AgentState) -> AgentState:
 
     user_input = state["user_input"].lower()
 
+    # Nếu không có project_id, hướng dẫn user dùng Dashboard UI
     if not state.get("project_id"):
-        if is_create_project_intent(user_input):
-            state["next_step"] = "planner"
-            route_reason = "planner_forced_null_project_id_create_intent"
-        else:
-            state["next_step"] = "end"
-            state["messages"].append(
-                {
-                    "role": "assistant",
-                    "content": "Vui lòng chọn một project có sẵn ở sidebar Dashboard hoặc yêu cầu tạo project mới.",
-                }
-            )
-            route_reason = "missing_project_id_require_dashboard_selection"
-
+        state["next_step"] = "end"
+        state["messages"].append(
+            {
+                "role": "assistant",
+                "content": "Vui lòng chọn một project có sẵn ở sidebar Dashboard hoặc tạo project mới từ Dashboard (tab Quản lý Project).",
+            }
+        )
+        route_reason = "missing_project_id_require_dashboard_selection"
         log_event(logger, "supervisor.route", decision=state["next_step"], reason=route_reason, state=summarize_graph_state(state))
         log_event(logger, "supervisor.exit", elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2), state=summarize_graph_state(state))
         return state
-    
-    if is_create_project_intent(user_input):
-        state["current_phase"] = "planning"
-        state["next_step"] = "planner"
-        route_reason = "create_project_keyword"
-    elif "update" in user_input or "tiến độ" in user_input:
+
+    # Có project_id → routing theo keyword
+    if "update" in user_input or "tiến độ" in user_input or "progress" in user_input:
         state["current_phase"] = "tracking"
         state["next_step"] = "progress_tracker"
         route_reason = "progress_keyword"
-    elif "rủi ro" in user_input:
+    elif "rủi ro" in user_input or "risk" in user_input or "phân tích" in user_input:
         state["next_step"] = "risk_assessment"
         route_reason = "risk_keyword"
+    elif "gợi ý" in user_input or "đề xuất" in user_input or "assign" in user_input.lower() or "phân công" in user_input or "gán việc" in user_input:
+        state["next_step"] = "task_divider"
+        route_reason = "assignment_keyword"
+    elif "nhắc" in user_input or "remind" in user_input.lower() or "deadline" in user_input.lower() or "hạn" in user_input:
+        state["next_step"] = "reminder"
+        route_reason = "reminder_keyword"
     else:
-        # Default flow
-        if state.get("current_phase") == "planning":
-            state["next_step"] = "task_divider"
-            route_reason = "planning_default"
-        else:
-            state["next_step"] = "planner"
-            route_reason = "fallback_planner"
-    
+        # Fallback: hướng dẫn user
+        state["next_step"] = "end"
+        state["messages"].append(
+            {
+                "role": "assistant",
+                "content": "Tôi có thể giúp bạn:\n"
+                           "1️⃣ **Gợi ý assignment**: 'gợi ý assignment cho project này'\n"
+                           "2️⃣ **Phân tích rủi ro**: 'phân tích rủi ro'\n"
+                           "3️⃣ **Xem tiến độ**: 'cập nhật tiến độ'\n"
+                           "4️⃣ **Nhắc deadline**: 'nhắc task sắp hạn'",
+            }
+        )
+        route_reason = "fallback_help"
+
     log_event(logger, "supervisor.route", decision=state["next_step"], reason=route_reason, state=summarize_graph_state(state))
     log_event(logger, "supervisor.exit", elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2), state=summarize_graph_state(state))
     return state
 
 
-def planner_node(state: AgentState) -> AgentState:
-    """Gọi Planner Agent"""
-    from app.agents.planner_agent import planner_agent
-    started_at = time.perf_counter()
-    log_event(logger, "planner_node.enter", state=summarize_graph_state(state))
-    result = normalize_agent_result(planner_agent(state["user_input"], state["user_id"], state.get("project_data")))
-    state["messages"].append({"role": "assistant", "content": result["response"]})
-    state["project_data"] = result.get("project_data") or {}
-    state["project_id"] = result.get("project_id")
-    state["tasks"] = (state.get("project_data") or {}).get("tasks") or []
-    state["risks"] = (state.get("project_data") or {}).get("initial_risks") or state.get("risks", [])
-    
-    log_audit("create_project", "Project", state.get("project_id"), state["user_id"], result)
-    log_event(
-        logger,
-        "planner_node.exit",
-        elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2),
-        project_id=state.get("project_id"),
-        project_name=(state.get("project_data") or {}).get("project_name") or (state.get("project_data") or {}).get("name"),
-        state=summarize_graph_state(state),
-    )
-    return state
-
-
 def task_divider_node(state: AgentState) -> AgentState:
-    """Phân chia task và gán người"""
+    """Phân chia task và gán người (REFACTORED: chỉ recommend, không lưu DB)"""
     from app.agents.task_divider import task_divider_agent
     started_at = time.perf_counter()
     log_event(logger, "task_divider_node.enter", state=summarize_graph_state(state))
     if not state.get("project_id"):
-        message = "Chưa có project_id, bỏ qua task divider để tránh lỗi DB."
+        message = "Chưa có project_id, bỏ qua task divider."
         state["messages"].append({"role": "assistant", "content": message})
         log_event(logger, "task_divider_node.skip", level="warning", reason="missing_project_id", state=summarize_graph_state(state))
         return state
+
+    # Lấy dữ liệu từ DB thay vì từ state (AI không còn tạo project_data/tasks)
+    project_data = state.get("project_data") or {}
+    tasks = state.get("tasks") or []
+
     result = normalize_agent_result(task_divider_agent(
-        state["project_id"], 
-        state["project_data"], 
-        state.get("tasks", [])
+        state["project_id"],
+        project_data,
+        tasks
     ))
     state["tasks"] = result.get("tasks") or []
     state["messages"].append({"role": "assistant", "content": result["response"]})
@@ -230,7 +186,7 @@ def progress_tracker_node(state: AgentState) -> AgentState:
     started_at = time.perf_counter()
     log_event(logger, "progress_tracker_node.enter", state=summarize_graph_state(state))
     if not state.get("project_id"):
-        message = "Chưa có project_id, bỏ qua progress tracker để tránh lỗi DB."
+        message = "Chưa có project_id, bỏ qua progress tracker."
         state["messages"].append({"role": "assistant", "content": message})
         log_event(logger, "progress_tracker_node.skip", level="warning", reason="missing_project_id", state=summarize_graph_state(state))
         return state
@@ -252,7 +208,7 @@ def risk_assessment_node(state: AgentState) -> AgentState:
     started_at = time.perf_counter()
     log_event(logger, "risk_assessment_node.enter", state=summarize_graph_state(state))
     if not state.get("project_id"):
-        message = "Chưa có project_id, bỏ qua risk assessment để tránh lỗi DB."
+        message = "Chưa có project_id, bỏ qua risk assessment."
         state["messages"].append({"role": "assistant", "content": message})
         log_event(logger, "risk_assessment_node.skip", level="warning", reason="missing_project_id", state=summarize_graph_state(state))
         return state
@@ -278,7 +234,6 @@ def reminder_node(state: AgentState) -> AgentState:
     from app.agents.reminder_agent import reminder_agent
     started_at = time.perf_counter()
     log_event(logger, "reminder_node.enter", state=summarize_graph_state(state))
-    # Prevent repeated re-entry to this node within the same invoke
     visited = state.get("_visited_nodes") or []
     if "reminder" in visited:
         log_event(logger, "reminder_node.already_visited", state=summarize_graph_state(state))
@@ -295,7 +250,6 @@ def reminder_node(state: AgentState) -> AgentState:
         response_preview=truncate_text(result.get("response"), 180),
         state=summarize_graph_state(state),
     )
-    # Ensure we don't loop back into reminder repeatedly
     state["next_step"] = "end"
     return state
 
@@ -349,17 +303,15 @@ def risk_requires_approval(risk: dict) -> bool:
 # ====================== CONDITIONAL EDGE ======================
 
 def route_next(state: AgentState) -> str:
-    """Routing logic"""
+    """Routing logic (REFACTORED: đã xóa planner)"""
     next_step = state.get("next_step")
 
     if state.get("needs_human_approval") and state.get("approval_response") not in {"approved", "rejected"}:
         decision = "human_approval"
         log_event(logger, "route_next", decision=decision, state=summarize_graph_state(state))
         return decision
-    
-    if next_step == "planner":
-        decision = "planner"
-    elif next_step == "task_divider":
+
+    if next_step == "task_divider":
         decision = "task_divider"
     elif next_step == "progress_tracker":
         decision = "progress_tracker"
@@ -403,26 +355,24 @@ def route_after_approval(state: AgentState) -> str:
 # ====================== BUILD GRAPH ======================
 
 def build_graph():
-    """Xây dựng LangGraph"""
+    """Xây dựng LangGraph (REFACTORED: đã xóa planner)"""
     workflow = StateGraph(AgentState)
-    
+
     # Add nodes
     workflow.add_node("supervisor", supervisor_node)
-    workflow.add_node("planner", planner_node)
     workflow.add_node("task_divider", task_divider_node)
     workflow.add_node("progress_tracker", progress_tracker_node)
     workflow.add_node("risk_assessment", risk_assessment_node)
     workflow.add_node("reminder", reminder_node)
     workflow.add_node("human_approval", human_approval_node)
-    
+
     # Add edges
     workflow.set_entry_point("supervisor")
-    
+
     workflow.add_conditional_edges(
         "supervisor",
         route_next,
         {
-            "planner": "planner",
             "task_divider": "task_divider",
             "progress_tracker": "progress_tracker",
             "risk_assessment": "risk_assessment",
@@ -430,9 +380,12 @@ def build_graph():
             END: END
         }
     )
-    
-    workflow.add_edge("planner", "task_divider")
-    workflow.add_edge("task_divider", "risk_assessment")
+
+    # Task divider chỉ recommend, không chain tiếp
+    workflow.add_edge("task_divider", END)
+
+    workflow.add_edge("progress_tracker", "reminder")
+
     workflow.add_conditional_edges(
         "risk_assessment",
         route_after_risk,
@@ -442,7 +395,7 @@ def build_graph():
             END: END,
         }
     )
-    workflow.add_edge("progress_tracker", "reminder")
+
     workflow.add_conditional_edges(
         "human_approval",
         route_after_approval,
@@ -451,10 +404,10 @@ def build_graph():
             END: END,
         }
     )
+
     workflow.add_edge("reminder", END)
-    
-    # Initialize optional tracing/checkpointer only when configured to avoid
-    # network calls during unit tests or local runs without LangSmith enabled.
+
+    # Initialize optional tracing/checkpointer
     memory = None
     if getattr(config, "LANGSMITH_TRACING", False):
         os.environ["LANGCHAIN_TRACING_V2"] = "true"
@@ -464,7 +417,7 @@ def build_graph():
         memory = MemorySaver()
 
     app = workflow.compile(checkpointer=memory)
-    
+
     return app
 
 

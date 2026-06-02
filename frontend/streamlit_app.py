@@ -281,7 +281,7 @@ with tab1:
                         "messages": [],
                         "tasks": [],
                         "risks": [],
-                        "current_phase": "planning"
+                        "current_phase": "ready"
                     }
                     result = run_orchestrator(inputs)
                     response_text = result.get("messages", [])[-1].get("content", "Đã xử lý xong.") \
@@ -470,7 +470,7 @@ with tab2:
 
             # Cache Statistics
             try:
-                cache_keys = redis_client.client.keys("planner:*") + redis_client.client.keys("risk:*")
+                cache_keys = redis_client.client.keys("task_divider:*") + redis_client.client.keys("risk:*")
                 st.metric("Total Cached Items", len(cache_keys))
             except:
                 st.metric("Total Cached Items", "N/A")

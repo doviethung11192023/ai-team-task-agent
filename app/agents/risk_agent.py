@@ -1,7 +1,7 @@
 # app/agents/risk_agent.py
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
-from app.prompts.planner_prompts import RISK_SYSTEM_PROMPT
+from app.prompts.risk_prompts import RISK_SYSTEM_PROMPT
 from app.models.schemas import AgentResponse
 from app.database.supabase_client import db
 from app.database.redis_client import redis_client
@@ -14,7 +14,7 @@ from app.utils.logger import get_logger, log_event, truncate_text, summarize_seq
 from app.utils.serialization import serialize_for_json
 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash", 
+    model="gemini-2.5-flash",
     temperature=0.3,
     google_api_key=config.GEMINI_API_KEY
 )
@@ -42,7 +42,7 @@ def risk_agent(project_id: str, project_data: dict = None, tasks: list = None) -
             project_data_keys=sorted(list((project_data or {}).keys()))[:10],
             tasks_summary=summarize_sequence(tasks, sample_key="title"),
         )
-        
+
         cached_result = redis_client.get(cache_key)
         if cached_result:
             log_event(logger, "risk.cache.hit", cache_key=cache_key, project_id=project_id)

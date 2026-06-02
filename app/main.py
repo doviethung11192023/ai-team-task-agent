@@ -53,7 +53,7 @@ async def chat(request: ChatRequest):
         "messages": [],
         "tasks": [],
         "risks": [],
-        "current_phase": "planning"
+        "current_phase": "ready"
     }
     
     result = orchestrator.invoke(inputs, config=build_graph_config(user_id))

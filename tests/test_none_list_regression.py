@@ -57,7 +57,6 @@ sys.modules['redis'] = redis_mod
 
 # Provide lightweight agent stubs so orchestrator import doesn't pull real dependencies
 agent_names = [
-    'app.agents.planner_agent',
     'app.agents.task_divider',
     'app.agents.progress_tracker',
     'app.agents.risk_agent',
@@ -86,7 +85,7 @@ def test_none_list_does_not_throw(monkeypatch):
         "messages": [],
         "tasks": [],
         "risks": [],
-        "current_phase": "planning",
+        "current_phase": "ready",
     }
 
     # Should not raise TypeError

@@ -1,7 +1,7 @@
 # app/agents/task_divider.py
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
-from app.prompts.planner_prompts import TASK_DIVIDER_SYSTEM_PROMPT
+from app.prompts.task_divider_prompts import TASK_DIVIDER_SYSTEM_PROMPT
 from app.models.schemas import AgentResponse
 from app.database.supabase_client import db
 from app.database.redis_client import redis_client
@@ -15,7 +15,7 @@ from app.utils.logger import get_logger, log_event, truncate_text, summarize_seq
 from app.utils.serialization import serialize_for_json
 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash", 
+    model="gemini-2.5-flash",
     temperature=0.2,
     google_api_key=config.GEMINI_API_KEY
 )
@@ -113,103 +113,30 @@ def task_divider_agent(project_id: str, project_data: dict = None, raw_tasks: li
             result = {"assigned_tasks": [], "workload_summary": {}, "suggestions": ["Không parse được JSON"]}
             log_event(logger, "task_divider.parse.fallback", level="warning", project_id=project_id)
 
-        # Lưu tasks vào database
-        created_tasks = []
-        assigned_tasks = []
-        if result.get("assigned_tasks"):
-            tasks_to_create = []
-            for task in result["assigned_tasks"][:12]:  # Giới hạn
-                assigned_user_id = _resolve_assignee_user_id(task.get("assigned_to"), team_members)
-                tasks_to_create.append({
-                    "project_id": project_id,
-                    "title": task.get("task_title"),
-                    "description": task.get("description", "Auto generated"),
-                    "due_date": _resolve_due_date(task),
-                    "priority": task.get("priority", "Medium"),
-                    "status": "Todo"
-                })
-                assigned_tasks.append({
-                    "task_title": task.get("task_title"),
-                    "assigned_to": task.get("assigned_to"),
-                    "assigned_user_id": assigned_user_id,
-                    "reason": task.get("reason"),
-                    "description": task.get("description", "Auto generated"),
-                    "priority": task.get("priority", "Medium"),
-                    "due_date": _resolve_due_date(task).isoformat(),
-                })
-            if tasks_to_create:
-                created_tasks = db.create_tasks_batch(tasks_to_create)
-                log_event(logger, "task_divider.db.tasks_created", project_id=project_id, tasks_to_create_count=len(tasks_to_create))
-                task_assignments = []
-                for created_task, assigned_task in zip(created_tasks, assigned_tasks):
-                    assigned_user_id = assigned_task.get("assigned_user_id")
-                    if not assigned_user_id:
-                        continue
-                    task_assignments.append({
-                        "task_id": created_task.get("task_id"),
-                        "user_id": assigned_user_id,
-                        "assigned_by": None,
-                    })
-
-                if task_assignments:
-                    # Ensure assigned users are members of the project; create missing project_members
-                    existing_members = {m.get("user_id") for m in db.get_project_members(project_id) or []}
-                    new_members_created = []
-                    for ta in task_assignments:
-                        uid = ta.get("user_id")
-                        if uid and uid not in existing_members:
-                            try:
-                                db.create_project_member(project_id, uid, role_in_project="Member", workload_capacity=100)
-                                existing_members.add(uid)
-                                new_members_created.append(uid)
-                            except Exception as e:
-                                log_event(
-                                    logger,
-                                    "task_divider.project_member.create.error",
-                                    level="warning",
-                                    project_id=project_id,
-                                    user_id=uid,
-                                    error_type=type(e).__name__,
-                                    error=str(e),
-                                )
-
-                    if new_members_created:
-                        log_event(
-                            logger,
-                            "task_divider.project_member.created",
-                            project_id=project_id,
-                            created_count=len(new_members_created),
-                            user_ids=new_members_created,
-                        )
-                    db.create_task_assignments_batch(task_assignments)
-                    log_event(
-                        logger,
-                        "task_divider.db.task_assignments_created",
-                        project_id=project_id,
-                        task_assignments_count=len(task_assignments),
-                    )
-                elif created_tasks:
-                    log_event(
-                        logger,
-                        "task_divider.db.task_assignments_skipped",
-                        level="warning",
-                        project_id=project_id,
-                        reason="no_resolved_assignee",
-                    )
+        # REFACTORED: Task Divider chỉ recommend, KHÔNG tạo task hay lưu DB
+        # Tạo task_recommendations từ kết quả LLM
+        task_recommendations = []
+        for task in (result.get("assigned_tasks") or []):
+            assigned_user_id = _resolve_assignee_user_id(task.get("assigned_to"), team_members)
+            task_recommendations.append({
+                "task_title": task.get("task_title"),
+                "assigned_to": task.get("assigned_to"),
+                "assigned_user_id": assigned_user_id,
+                "reason": task.get("reason"),
+                "description": task.get("description", ""),
+                "priority": task.get("priority", "Medium"),
+                "due_date": _resolve_due_date(task).isoformat(),
+            })
 
         final_result = AgentResponse(
-            response=f"✅ Đã phân chia {len(result.get('assigned_tasks', []))} tasks cho team.",
-            tasks=[
-                {
-                    **created_task,
-                    **assigned_task,
-                }
-                for created_task, assigned_task in zip(created_tasks, assigned_tasks)
-            ] or assigned_tasks,
+            response=f"✅ Đã phân tích {len(result.get('assigned_tasks', []))} tasks. "
+                     f"Vui lòng review và approve assignments trong Dashboard.",
+            tasks=task_recommendations,
             success=True
         ).dict()
 
-        redis_client.set(cache_key, final_result, expire=1200)  # Cache 20 phút
+        # Cache 20 phút
+        redis_client.set(cache_key, final_result, expire=1200)
         log_event(
             logger,
             "task_divider.cache.save",

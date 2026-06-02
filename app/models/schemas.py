@@ -124,7 +124,7 @@ class ProjectState(BaseModel):
     project_data: Optional[Dict] = None
     tasks: List[Dict] = Field(default_factory=list)
     risks: List[Dict] = Field(default_factory=list)
-    next_step: str = "planner"
+    next_step: str = "end"
     needs_human_approval: bool = False
     approval_response: Optional[str] = None
     current_phase: str = "planning"

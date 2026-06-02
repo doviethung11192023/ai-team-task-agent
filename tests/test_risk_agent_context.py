@@ -1,4 +1,38 @@
 from datetime import datetime
+import sys
+import types
+
+# Stub external LLM modules so tests don't require real langchain installs
+llm_mod = types.ModuleType("langchain_google_genai")
+class DummyLLM:
+    def __init__(self, *args, **kwargs):
+        pass
+    def invoke(self, messages):
+        class R:
+            content = ""
+        return R()
+llm_mod.ChatGoogleGenerativeAI = DummyLLM
+sys.modules["langchain_google_genai"] = llm_mod
+
+msgs_mod = types.ModuleType("langchain_core.messages")
+class HumanMessage:
+    def __init__(self, content=None):
+        self.content = content
+class SystemMessage:
+    def __init__(self, content=None):
+        self.content = content
+msgs_mod.HumanMessage = HumanMessage
+msgs_mod.SystemMessage = SystemMessage
+sys.modules["langchain_core.messages"] = msgs_mod
+
+# Stub langsmith traceable
+langsmith_mod = types.ModuleType("langsmith")
+def fake_traceable(*args, **kwargs):
+    def wrapper(func):
+        return func
+    return wrapper
+langsmith_mod.traceable = fake_traceable
+sys.modules["langsmith"] = langsmith_mod
 
 import app.agents.risk_agent as risk_module
 
