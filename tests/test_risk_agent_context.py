@@ -79,6 +79,9 @@ def test_risk_agent_uses_planner_context_and_serializes_datetimes(monkeypatch):
     monkeypatch.setattr(risk_module.db, "get_project", lambda project_id: (_ for _ in ()).throw(AssertionError("db.get_project should not be called")))
     monkeypatch.setattr(risk_module.db, "get_tasks_by_project", lambda project_id: (_ for _ in ()).throw(AssertionError("db.get_tasks_by_project should not be called")))
     monkeypatch.setattr(risk_module.db, "create_risks_batch", lambda risks: risks)
+    # Phase 6: mock new DB calls used by rule-based detection
+    monkeypatch.setattr(risk_module.db, "get_member_workload", lambda project_id: [])
+    monkeypatch.setattr(risk_module.db, "calculate_project_progress", lambda project_id: 50)
 
     result = risk_module.risk_agent("project-1", project_data=project_data, tasks=tasks)
 
