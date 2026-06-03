@@ -243,7 +243,29 @@ class SupabaseDB:
             """,
             (project_id,),
         )
-
+    def get_tasks_by_project_status(self, project_id: str) -> List[Dict]:
+        return self._fetchall(
+            """
+            SELECT
+                task_id::text,
+                project_id::text,
+                title,
+                description,
+                status,
+                priority,
+                estimated_hours,
+                actual_hours,
+                start_date,
+                due_date,
+                parent_task_id::text,
+                created_at,
+                updated_at
+            FROM tasks
+            WHERE project_id = %s AND status = 'Todo'
+            ORDER BY created_at DESC
+            """,
+            (project_id,),
+        )
     def create_tasks_batch(self, tasks: List[Dict]) -> List[Dict]:
         if not tasks:
             return []

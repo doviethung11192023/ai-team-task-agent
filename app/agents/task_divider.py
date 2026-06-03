@@ -81,6 +81,24 @@ def task_divider_agent(project_id: str, project_data: dict = None, raw_tasks: li
         team_members = db.get_users()
         log_event(logger, "task_divider.team_members.loaded", project_id=project_id, team_members_summary=summarize_sequence(team_members, sample_key="name"))
 
+        # Tự động load tasks từ DB nếu không được cung cấp
+        if not raw_tasks:
+            raw_tasks = db.get_tasks_by_project_status(project_id) or []
+            log_event(logger, "task_divider.tasks.loaded_from_db", project_id=project_id, tasks_count=len(raw_tasks))
+
+        # Tự động load project data từ DB nếu không được cung cấp
+        if not project_data:
+            project = db.get_project(project_id)
+            if project:
+                project_data = {
+                    "project_name": project.get("name"),
+                    "project_description": project.get("description"),
+                    "start_date": str(project.get("start_date") or ""),
+                    "end_date": str(project.get("end_date") or ""),
+                    "status": project.get("status"),
+                }
+                log_event(logger, "task_divider.project.loaded_from_db", project_id=project_id, project_name=project_data.get("project_name"))
+
         prompt = f"""
         {TASK_DIVIDER_SYSTEM_PROMPT}
 

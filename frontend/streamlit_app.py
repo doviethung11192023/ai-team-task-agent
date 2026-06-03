@@ -193,7 +193,7 @@ with st.sidebar:
         st.session_state.dashboard_snapshot = None
         st.rerun()
 
-    if st.button("🔄 Reset Conversation"):
+    if st.button("🔄 Reset Conversation",use_container_width=True):
         st.session_state.messages = []
         st.rerun()
 
@@ -737,7 +737,9 @@ with tab2:
                         }
                         with st.spinner("AI đang phân tích..."):
                             result = run_orchestrator(inputs)
+                            print("Orchestrator result for assignment recommendation:", result)
                             if result.get("tasks"):
+                                print("Received task recommendations:", result.get("tasks"))
                                 st.session_state.task_recommendations = {
                                     "project_id": selected_project_id,
                                     "tasks": result.get("tasks", []),
@@ -774,30 +776,30 @@ with tab2:
                             st.info(f"💡 **Gợi ý**: {recommended_name} — {reason}")
 
                         col_a, col_b = st.columns([3, 1])
-                        with col_a:
-                            selected_assignee = st.selectbox(
-                                "Chọn người thực hiện",
-                                options=[""] + list(user_options.keys()),
-                                format_func=lambda x: user_options.get(x, "Chưa chọn") if x else "— Chưa gán —",
-                                key=f"assign_{rec.get('task_title', 'task')}_{uuid.uuid4().hex[:4]}",
-                            )
-                        with col_b:
-                            if selected_assignee and st.button("✅ Gán", key=f"save_assign_{uuid.uuid4().hex[:4]}"):
-                                # Lưu assignment ngay
-                                task_id = None
-                                for t in tasks:
-                                    if t.get("title") == rec.get("task_title"):
-                                        task_id = t.get("task_id")
-                                        break
-                                if task_id:
-                                    db.create_task_assignments_batch([{
-                                        "task_id": task_id,
-                                        "user_id": selected_assignee,
-                                        "assigned_by": user_id,
-                                    }])
-                                    st.success(f"Đã gán {rec.get('task_title')} cho {user_options.get(selected_assignee)}")
-                                    st.session_state.dashboard_snapshot = None
-                                    st.rerun()
+                        # with col_a:
+                        #     selected_assignee = st.selectbox(
+                        #         "Chọn người thực hiện",
+                        #         options=[""] + list(user_options.keys()),
+                        #         format_func=lambda x: user_options.get(x, "Chưa chọn") if x else "— Chưa gán —",
+                        #         key=f"assign_{rec.get('task_title', 'task')}_{uuid.uuid4().hex[:4]}",
+                        #     )
+                        # with col_b:
+                        #     if selected_assignee and st.button("✅ Gán", key=f"save_assign_{uuid.uuid4().hex[:4]}"):
+                        #         # Lưu assignment ngay
+                        #         task_id = None
+                        #         for t in tasks:
+                        #             if t.get("title") == rec.get("task_title"):
+                        #                 task_id = t.get("task_id")
+                        #                 break
+                        #         if task_id:
+                        #             db.create_task_assignments_batch([{
+                        #                 "task_id": task_id,
+                        #                 "user_id": selected_assignee,
+                        #                 "assigned_by": user_id,
+                        #             }])
+                        #             st.success(f"Đã gán {rec.get('task_title')} cho {user_options.get(selected_assignee)}")
+                        #             st.session_state.dashboard_snapshot = None
+                        #             st.rerun()
                         st.divider()
 
             # Hiển thị tasks chưa assigned
@@ -827,6 +829,8 @@ with tab2:
                                 "user_id": sel,
                                 "assigned_by": user_id,
                             }])
+                            db.update_task_status(t["task_id"], "InProgress")
+                            
                             st.success("Đã gán!")
                             st.session_state.dashboard_snapshot = None
                             st.rerun()

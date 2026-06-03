@@ -151,7 +151,9 @@ def supervisor_node(state: AgentState) -> AgentState:
 def task_divider_node(state: AgentState) -> AgentState:
     """Phân chia task và gán người (REFACTORED: chỉ recommend, không lưu DB)"""
     from app.agents.task_divider import task_divider_agent
+    from app.database.supabase_client import db as orch_db
     started_at = time.perf_counter()
+    print("DEBUG: Entering task_divider_node with state:", summarize_graph_state(state))
     log_event(logger, "task_divider_node.enter", state=summarize_graph_state(state))
     if not state.get("project_id"):
         message = "Chưa có project_id, bỏ qua task divider."
@@ -159,9 +161,12 @@ def task_divider_node(state: AgentState) -> AgentState:
         log_event(logger, "task_divider_node.skip", level="warning", reason="missing_project_id", state=summarize_graph_state(state))
         return state
 
-    # Lấy dữ liệu từ DB thay vì từ state (AI không còn tạo project_data/tasks)
+    # Load tasks từ DB nếu state chưa có
     project_data = state.get("project_data") or {}
     tasks = state.get("tasks") or []
+    if not tasks:
+        tasks = orch_db.get_tasks_by_project(state["project_id"]) or []
+        log_event(logger, "task_divider_node.tasks.loaded_from_db", project_id=state.get("project_id"), tasks_count=len(tasks))
 
     result = normalize_agent_result(task_divider_agent(
         state["project_id"],
