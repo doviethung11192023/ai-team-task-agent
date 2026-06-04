@@ -15,7 +15,7 @@ class Config:
     DB_PASSWORD = os.getenv("DB_PASSWORD")
     DB_SSLMODE = os.getenv("DB_SSLMODE", "require")
 
-    # Supabase (giữ lại để linh hoạt)
+    # # Supabase (giữ lại để linh hoạt)
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
@@ -27,6 +27,7 @@ class Config:
     REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
     REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+    REDIS_URL = os.getenv("REDIS_URL")
 
     # LangSmith
     LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY")
