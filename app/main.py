@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 from datetime import date, datetime
 from uuid import UUID
+from psycopg2.extras import RealDictCursor
 
 from app.graph.orchestrator import orchestrator
 from app.jobs.reminder_job import reminder_job
@@ -79,6 +80,12 @@ class AssignmentSaveRequest(BaseModel):
     task_id: str
     user_id: str
     assigned_by: Optional[str] = None
+
+
+class AssignTaskRequest(BaseModel):
+    user_id: str
+    assigned_by: Optional[str] = None
+    propagate_to_children: bool = True
 
 
 # ====================== HELPERS ======================
@@ -247,6 +254,8 @@ async def create_task(project_id: str, req: TaskCreateRequest):
             "parent_task_id": req.parent_task_id,
         }])
         log_event(logger, "api.task.created", project_id=project_id, title=req.title)
+        from app.database.redis_client import redis_client
+        redis_client.delete_pattern(f"dashboard:{project_id}")
         return {"success": True, "data": tasks[0] if tasks else None}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -334,8 +343,11 @@ async def update_task_status(task_id: str, status: str, actual_hours: Optional[f
 
 @app.post("/api/tasks/{task_id}/subtasks")
 async def create_subtask(task_id: str, req: TaskCreateRequest):
-    """Tạo subtask (gắn parent_task_id)"""
-    parent = db._fetchone("SELECT task_id, project_id FROM tasks WHERE task_id = %s", (task_id,))
+    """Tạo subtask (gắn parent_task_id) — tự động inherit assignee từ task cha nếu có"""
+    parent = db._fetchone(
+        "SELECT task_id, project_id FROM tasks WHERE task_id = %s",
+        (task_id,),
+    )
     if not parent:
         raise HTTPException(status_code=404, detail="Parent task not found")
 
@@ -350,8 +362,27 @@ async def create_subtask(task_id: str, req: TaskCreateRequest):
         "due_date": req.due_date,
         "parent_task_id": task_id,
     }])
+    new_task = tasks[0] if tasks else None
+
+    # Auto-inherit assignee từ task cha
+    if new_task:
+        parent_assignee = db.get_task_assignee(task_id)
+        if parent_assignee:
+            db.create_task_assignments_batch([{
+                "task_id": new_task["task_id"],
+                "user_id": parent_assignee["user_id"],
+                "assigned_by": parent_assignee.get("assigned_by") or parent_assignee["user_id"],
+            }])
+            log_event(
+                logger, "api.subtask.auto_assigned",
+                task_id=new_task["task_id"], parent_task_id=task_id,
+                user_id=parent_assignee["user_id"],
+            )
+            # Update status
+            db.update_task_status(new_task["task_id"], "InProgress")
+
     log_event(logger, "api.subtask.created", parent_task_id=task_id, title=req.title)
-    return {"success": True, "data": tasks[0] if tasks else None}
+    return {"success": True, "data": new_task}
 
 
 # ====================== ASSIGNMENTS ======================
@@ -369,6 +400,124 @@ async def save_assignments(project_id: str, assignments: List[AssignmentSaveRequ
 async def get_assignments(project_id: str):
     """Lấy assignments của project"""
     return {"data": db.get_task_assignments_by_project(project_id) or []}
+
+
+# ====================== COMPOSITE DASHBOARD ======================
+
+@app.get("/api/projects/{project_id}/dashboard")
+async def get_dashboard(project_id: str):
+    """Composite endpoint — trả về tất cả dữ liệu Dashboard trong 1 request"""
+    from app.database.redis_client import redis_client
+
+    cache_key = f"dashboard:{project_id}"
+    cached = redis_client.get(cache_key)
+    if cached:
+        return {"data": cached, "cached": True}
+
+    project = db.get_project(project_id) or {}
+    tasks = db.get_tasks_by_project(project_id) or []
+    members = db.get_project_members(project_id) or []
+    assignments = db.get_task_assignments_by_project(project_id) or []
+    status_summary = db.get_task_status_summary(project_id) or {}
+    overdue_tasks = db.get_overdue_tasks(project_id) or []
+    risks = db.get_risks_by_project(project_id) or []
+    risk_summary = db.get_risk_summary(project_id) or {}
+    workload = db.get_member_workload(project_id) or []
+    audit_logs = db.get_audit_logs(project_id=project_id, limit=30) or []
+
+    assignees_by_task = {}
+    for assignment in assignments:
+        task_id = assignment.get("task_id")
+        assignee_name = assignment.get("assignee_name") or "Unknown"
+        if task_id:
+            assignees_by_task.setdefault(task_id, []).append(assignee_name)
+
+    task_map = {}
+    for t in tasks:
+        tid = t.get("task_id")
+        task_map[tid] = {**t, "children": []}
+    roots = []
+    for t in task_map.values():
+        parent_id = t.get("parent_task_id")
+        if parent_id and parent_id in task_map:
+            task_map[parent_id]["children"].append(t)
+        else:
+            roots.append(t)
+
+    data = {
+        "project": project,
+        "tasks": tasks,
+        "task_tree": roots,
+        "members": members,
+        "assignments": assignments,
+        "assignees_by_task": assignees_by_task,
+        "status_summary": status_summary,
+        "overdue_tasks": overdue_tasks,
+        "risks": risks,
+        "risk_summary": risk_summary,
+        "workload": workload,
+        "audit_logs": audit_logs,
+    }
+
+    redis_client.set(cache_key, data, expire=30)
+    return {"data": data, "cached": False}
+
+
+# ====================== ASSIGN TASK (WITH PROPAGATION) ======================
+
+@app.post("/api/tasks/{task_id}/assign")
+async def assign_task(task_id: str, req: AssignTaskRequest):
+    """Gán task cho user — mặc định propagate xuống tất cả children"""
+    task = db._fetchone(
+        "SELECT task_id::text, project_id::text, title, status FROM tasks WHERE task_id = %s",
+        (task_id,),
+    )
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if req.propagate_to_children:
+        result = db.assign_task_with_children(task_id, req.user_id, req.assigned_by or req.user_id)
+        log_event(
+            logger, "api.task.assign.propagated",
+            task_id=task_id, user_id=req.user_id,
+            assigned_count=result["assigned_count"],
+        )
+    else:
+        db._ensure_connection()
+        try:
+            with db.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("DELETE FROM task_assignments WHERE task_id = %s", (task_id,))
+                cursor.execute(
+                    """
+                    INSERT INTO task_assignments (task_id, user_id, assigned_by)
+                    VALUES (%s, %s, %s)
+                    RETURNING assignment_id::text, task_id::text, user_id::text, assigned_at, assigned_by::text
+                    """,
+                    (task_id, req.user_id, req.assigned_by or req.user_id),
+                )
+                cursor.execute(
+                    "UPDATE tasks SET status = 'InProgress', updated_at = NOW() WHERE task_id = %s AND status = 'Todo'",
+                    (task_id,),
+                )
+            db.conn.commit()
+            result = {"assigned_count": 1, "task_ids": [task_id]}
+        except Exception:
+            db.conn.rollback()
+            raise
+
+    from app.database.redis_client import redis_client
+    redis_client.delete_pattern(f"dashboard:{task.get('project_id')}")
+
+    return {
+        "success": True,
+        "data": {
+            "task_id": task_id,
+            "user_id": req.user_id,
+            "assigned_count": result["assigned_count"],
+            "task_ids": result["task_ids"],
+            "propagated_to_children": req.propagate_to_children,
+        },
+    }
 
 
 # ====================== RISKS ======================

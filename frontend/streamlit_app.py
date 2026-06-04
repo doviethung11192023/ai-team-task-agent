@@ -34,6 +34,12 @@ def _get_projects_for_scope(selected_scope: str, selected_user_id: str):
 
 
 def _build_dashboard_snapshot(project_id: str) -> dict:
+    """Build composite dashboard với Redis cache 30s — 1 lần query thay 10+"""
+    # Thử lấy từ Redis cache trước
+    cached = redis_client.get(f"dashboard:{project_id}")
+    if cached:
+        return cached
+
     project = db.get_project(project_id) or {}
     tasks = db.get_tasks_by_project(project_id) or []
     members = db.get_project_members(project_id) or []
@@ -53,19 +59,37 @@ def _build_dashboard_snapshot(project_id: str) -> dict:
             continue
         assignees_by_task.setdefault(task_id, []).append(assignee_name)
 
-    return {
+    # Build task tree
+    task_map = {}
+    for t in tasks:
+        tid = t.get("task_id")
+        task_map[tid] = {**t, "children": []}
+    roots = []
+    for t in task_map.values():
+        parent_id = t.get("parent_task_id")
+        if parent_id and parent_id in task_map:
+            task_map[parent_id]["children"].append(t)
+        else:
+            roots.append(t)
+
+    snapshot = {
         "project": project,
         "tasks": tasks,
+        "task_tree": roots,
         "members": members,
         "assignments": assignments,
+        "assignees_by_task": assignees_by_task,
         "status_summary": status_summary,
         "overdue_tasks": overdue_tasks,
         "risks": risks,
         "risk_summary": risk_summary,
         "workload": workload,
         "audit_logs": audit_logs,
-        "assignees_by_task": assignees_by_task,
     }
+
+    # Cache 30s
+    redis_client.set(f"dashboard:{project_id}", snapshot, expire=30)
+    return snapshot
 
 
 def _build_task_tree(tasks: list) -> list:
@@ -129,7 +153,12 @@ st.markdown("**Hệ thống quản lý công việc nhóm thông minh**")
 with st.sidebar:
     st.header("Thông tin")
 
-    available_users = db.get_users() or []
+    # Cache users list trong Redis 60s
+    available_users = redis_client.get("users:all")
+    if not available_users:
+        available_users = db.get_users() or []
+        if available_users:
+            redis_client.set("users:all", available_users, expire=60)
     user_options = [f"{user.get('name','Unknown')} ({user.get('email','')}) | {user.get('user_id')}" for user in available_users]
     user_map = {option: user for option, user in zip(user_options, available_users)}
 
@@ -203,7 +232,7 @@ with st.sidebar:
 
     if st.button("▶️ Start Reminder Job"):
         from app.jobs.reminder_job import reminder_job
-        reminder_job.start_background(interval_seconds=1800)
+        reminder_job.start_background(interval_seconds=30, project_id=st.session_state.current_project_id)
         st.success("Background Reminder Job đã bắt đầu!")
 
     if st.button("⏹️ Stop Reminder Job"):
@@ -541,7 +570,7 @@ with tab2:
                             st.write(f"{parent_hint}{t.get('title')} ({t.get('status')})")
                         with cols[1]:
                             new_status = st.selectbox(
-                                "Status",
+                                f"Status_{t['task_id']}",
                                 ["Todo", "InProgress", "Review", "Done"],
                                 index=["Todo", "InProgress", "Review", "Done"].index(t.get("status", "Todo")),
                                 key=f"status_{t['task_id']}",
@@ -575,7 +604,7 @@ with tab2:
                                     sub_due = st.date_input("Due", value=date.today(), key=f"sub_due_{t['task_id']}")
                                 if st.form_submit_button("Tạo Subtask"):
                                     if sub_title:
-                                        db.create_tasks_batch([{
+                                        new_tasks = db.create_tasks_batch([{
                                             "project_id": selected_project_id,
                                             "title": sub_title,
                                             "description": "",
@@ -584,6 +613,16 @@ with tab2:
                                             "due_date": sub_due,
                                             "parent_task_id": t["task_id"],
                                         }])
+                                        # Auto-inherit assignee từ task cha
+                                        if new_tasks:
+                                            parent_assignee = db.get_task_assignee(t["task_id"])
+                                            if parent_assignee:
+                                                db.create_task_assignments_batch([{
+                                                    "task_id": new_tasks[0]["task_id"],
+                                                    "user_id": parent_assignee["user_id"],
+                                                    "assigned_by": user_id,
+                                                }])
+                                                db.update_task_status(new_tasks[0]["task_id"], "InProgress")
                                         st.session_state[f"quick_sub_{t['task_id']}"] = False
                                         st.session_state.dashboard_snapshot = None
                                         st.rerun()
@@ -714,7 +753,7 @@ with tab2:
         if not selected_project_id:
             st.warning("Vui lòng chọn project từ sidebar trước.")
         else:
-            # Hiển thị recommendations
+            # Hiển thị recommendations từ AI
             recommendations = st.session_state.task_recommendations
             existing_assignments = db.get_task_assignments_by_project(selected_project_id) or []
             assigned_task_ids = {a.get("task_id") for a in existing_assignments}
@@ -737,9 +776,7 @@ with tab2:
                         }
                         with st.spinner("AI đang phân tích..."):
                             result = run_orchestrator(inputs)
-                            print("Orchestrator result for assignment recommendation:", result)
                             if result.get("tasks"):
-                                print("Received task recommendations:", result.get("tasks"))
                                 st.session_state.task_recommendations = {
                                     "project_id": selected_project_id,
                                     "tasks": result.get("tasks", []),
@@ -757,13 +794,69 @@ with tab2:
             top_level_tasks = [t for t in tasks if not t.get("parent_task_id")]
             unassigned_tasks = [t for t in top_level_tasks if t.get("task_id") not in assigned_task_ids]
 
+            all_users = db.get_users() or []
+            user_options = {"": "— Chưa gán —"}
+            for u in all_users:
+                user_options[u["user_id"]] = f"{u.get('name')} ({u.get('email')})"
+
+            # ---- BATCH ASSIGNMENT: 1 button cho tất cả tasks ----
+            if unassigned_tasks:
+                st.markdown(f"### 📋 Task chưa được gán ({len(unassigned_tasks)})")
+                st.caption("Chọn người cho từng task bên dưới, sau đó bấm **💾 Gán tất cả** để lưu 1 lần.")
+
+                # Gom selection vào session_state
+                if "batch_assign_selections" not in st.session_state:
+                    st.session_state.batch_assign_selections = {}
+
+                # Hiển thị tất cả unassigned tasks với selectbox
+                batch_data = []
+                for t in unassigned_tasks:
+                    task_id = t["task_id"]
+                    default_val = st.session_state.batch_assign_selections.get(task_id, "")
+                    col_a, col_b = st.columns([2, 3])
+                    with col_a:
+                        st.write(f"**{t.get('title')}**")
+                    with col_b:
+                        sel = st.selectbox(
+                            f"Người thực hiện cho {t.get('title')}",
+                            options=list(user_options.keys()),
+                            format_func=lambda x: user_options.get(x, "Unknown"),
+                            key=f"batch_assign_{task_id}",
+                            label_visibility="collapsed",
+                        )
+                    st.session_state.batch_assign_selections[task_id] = sel
+                    if sel:
+                        batch_data.append({"task_id": task_id, "user_id": sel})
+
+                # Nút "Gán tất cả" — 1 click, 1 DB batch write, có propagate
+                if batch_data:
+                    if st.button(f"💾 Gán tất cả ({len(batch_data)} tasks — sẽ propagate xuống children)", use_container_width=True, type="primary"):
+                        with st.spinner("Đang gán và propagate xuống children..."):
+                            success_count = 0
+                            total_count = 0
+                            for item in batch_data:
+                                try:
+                                    result = db.assign_task_with_children(
+                                        item["task_id"],
+                                        item["user_id"],
+                                        user_id,
+                                    )
+                                    success_count += 1
+                                    total_count += result["assigned_count"]
+                                except Exception as e:
+                                    st.error(f"Lỗi khi gán task {item['task_id']}: {str(e)}")
+
+                            st.session_state.batch_assign_selections = {}
+                            st.session_state.dashboard_snapshot = None
+                            st.success(f"✅ Đã gán {success_count} tasks cha + {total_count - success_count} children (tổng {total_count} tasks)!")
+                            st.rerun()
+            else:
+                st.info("Tất cả tasks top-level đã được gán hoặc chưa có task nào.")
+
+            # Hiển thị AI Recommendations (nếu có)
             if recommendations and recommendations.get("project_id") == selected_project_id:
+                st.divider()
                 st.markdown(f"### 💡 Đề xuất từ AI ({len(recommendations.get('tasks', []))} tasks)")
-
-                all_users = db.get_users() or []
-                user_options = {u.get("user_id"): f"{u.get('name')} ({u.get('email')})" for u in all_users}
-
-                assignments_to_save = []
 
                 for rec in recommendations.get("tasks", []):
                     with st.container():
@@ -771,71 +864,9 @@ with tab2:
                         assigned_uid = rec.get("assigned_user_id")
                         recommended_name = rec.get("assigned_to", "Unknown")
                         reason = rec.get("reason", "")
-
                         if assigned_uid and assigned_uid in user_options:
                             st.info(f"💡 **Gợi ý**: {recommended_name} — {reason}")
-
-                        col_a, col_b = st.columns([3, 1])
-                        # with col_a:
-                        #     selected_assignee = st.selectbox(
-                        #         "Chọn người thực hiện",
-                        #         options=[""] + list(user_options.keys()),
-                        #         format_func=lambda x: user_options.get(x, "Chưa chọn") if x else "— Chưa gán —",
-                        #         key=f"assign_{rec.get('task_title', 'task')}_{uuid.uuid4().hex[:4]}",
-                        #     )
-                        # with col_b:
-                        #     if selected_assignee and st.button("✅ Gán", key=f"save_assign_{uuid.uuid4().hex[:4]}"):
-                        #         # Lưu assignment ngay
-                        #         task_id = None
-                        #         for t in tasks:
-                        #             if t.get("title") == rec.get("task_title"):
-                        #                 task_id = t.get("task_id")
-                        #                 break
-                        #         if task_id:
-                        #             db.create_task_assignments_batch([{
-                        #                 "task_id": task_id,
-                        #                 "user_id": selected_assignee,
-                        #                 "assigned_by": user_id,
-                        #             }])
-                        #             st.success(f"Đã gán {rec.get('task_title')} cho {user_options.get(selected_assignee)}")
-                        #             st.session_state.dashboard_snapshot = None
-                        #             st.rerun()
                         st.divider()
-
-            # Hiển thị tasks chưa assigned
-            if unassigned_tasks:
-                st.markdown(f"### 📋 Task chưa được gán ({len(unassigned_tasks)})")
-                all_users = db.get_users() or []
-                user_options = {"": "— Chưa gán —"}
-                for u in all_users:
-                    user_options[u["user_id"]] = f"{u.get('name')} ({u.get('email')})"
-
-                for t in unassigned_tasks:
-                    cols = st.columns([2, 2, 1])
-                    with cols[0]:
-                        st.write(f"**{t.get('title')}**")
-                    with cols[1]:
-                        sel = st.selectbox(
-                            "",
-                            options=list(user_options.keys()),
-                            format_func=lambda x: user_options.get(x, "Unknown"),
-                            key=f"manual_assign_{t['task_id']}",
-                            label_visibility="collapsed",
-                        )
-                    with cols[2]:
-                        if sel and st.button("Gán", key=f"save_manual_{t['task_id']}"):
-                            db.create_task_assignments_batch([{
-                                "task_id": t["task_id"],
-                                "user_id": sel,
-                                "assigned_by": user_id,
-                            }])
-                            db.update_task_status(t["task_id"], "InProgress")
-                            
-                            st.success("Đã gán!")
-                            st.session_state.dashboard_snapshot = None
-                            st.rerun()
-            else:
-                st.info("Tất cả tasks top-level đã được gán hoặc chưa có task nào.")
 
             # Hiển thị assignments hiện tại
             if existing_assignments:
@@ -863,7 +894,12 @@ with tab2:
 
             # Cache Statistics
             try:
-                cache_keys = redis_client.client.keys("task_divider:*") + redis_client.client.keys("risk:*")
+                cache_keys = (
+                    redis_client.client.keys("task_divider:*")
+                    + redis_client.client.keys("risk:*")
+                    + redis_client.client.keys("dashboard:*")
+                    + redis_client.client.keys("users:*")
+                )
                 st.metric("Total Cached Items", len(cache_keys))
             except:
                 st.metric("Total Cached Items", "N/A")

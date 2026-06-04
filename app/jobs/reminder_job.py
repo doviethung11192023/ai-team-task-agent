@@ -13,11 +13,11 @@ class ReminderJob:
         self.is_running = False
         self.thread = None
 
-    def run_reminder(self):
+    def run_reminder(self, project_id:str=None):
         """Chạy reminder và đẩy kết quả vào Redis queue"""
         try:
-            result = reminder_agent()  # Gọi agent hiện tại
-            
+            result = reminder_agent(project_id=project_id)  # Gọi agent hiện tại
+
             # Lưu log reminder vào Redis
             log_entry = {
                 "timestamp": datetime.now().isoformat(),
@@ -40,7 +40,7 @@ class ReminderJob:
         except Exception as e:
             print(f"[{datetime.now()}] Reminder Job error: {e}")
 
-    def start_background(self, interval_seconds=3600):
+    def start_background(self, interval_seconds=3600, project_id:str=None):
         """Chạy background job định kỳ"""
         if self.is_running:
             print("Reminder Job is already running")
@@ -49,7 +49,7 @@ class ReminderJob:
         self.is_running = True
         
         def run_schedule():
-            schedule.every(interval_seconds).seconds.do(self.run_reminder)
+            schedule.every(interval_seconds).seconds.do(self.run_reminder, project_id=project_id)
             
             print(f"Background Reminder Job started - Check every {interval_seconds} seconds")
             

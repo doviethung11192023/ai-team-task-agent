@@ -5,6 +5,7 @@
 > **🔄 REFACTORED (v2.0):** Project và Task do **con người tạo** qua UI Form. AI chỉ đóng vai trò trợ lý: gợi ý assignment, phân tích rủi ro, theo dõi tiến độ, nhắc nhở. Planner Agent đã bị loại bỏ hoàn toàn.
 
 ---
+# ==================== LangSmith (Debug) ====================
 
 ## 📑 Mục lục
 
@@ -297,6 +298,28 @@ E:\agent\ai-team-task-agent\
 ### Triggers
 - `update_timestamp()` — BEFORE UPDATE on projects, tasks → tự động cập nhật `updated_at`
 
+### Database Methods (`SupabaseDB` class)
+
+**File:** `app/database/supabase_client.py`
+
+| Category | Method | Purpose |
+|----------|--------|---------|
+| **CRUD** | `get_users()`, `get_user(id)` | Users |
+| | `get_projects()`, `get_project(id)`, `create_project()` | Projects |
+| | `get_tasks_by_project(id)`, `create_tasks_batch()`, `update_task_status()` | Tasks |
+| | `get_project_members(id)`, `create_project_member()`, `delete_project_member()` | Members |
+| | `get_risks_by_project(id)`, `create_risks_batch()`, `update_risk_status()` | Risks |
+| **Assign** | `get_task_assignments_by_project(id)`, `create_task_assignments_batch()` | Assignments |
+| | `get_task_assignee(task_id)` | **NEW** — Lấy assignee hiện tại của 1 task |
+| | `get_task_children(task_id)` | **NEW** — Lấy children trực tiếp của task |
+| | `get_all_task_children_recursive(task_id)` | **NEW** — BFS lấy tất cả children đệ quy |
+| | `assign_task_with_children(task_id, user_id, assigned_by)` | **NEW** — Gán task + propagate xuống tất cả children |
+| **Cache** | `redis_client.delete_pattern(pattern)` | **NEW** — SCAN + DELETE keys matching glob pattern |
+| **Metrics** | `get_task_status_summary(id)`, `get_overdue_tasks(id)` | Summary |
+| | `get_member_workload(id)`, `get_risk_summary(id)` | Workload & Risks |
+| | `calculate_project_progress(id)` | Flat % Done (legacy) |
+| **Audit** | `log_audit()`, `get_audit_logs()` | Audit trail |
+
 ---
 
 ## 🤖 Các Agent
@@ -317,14 +340,15 @@ Tất cả agent đều dùng **ChatGoogleGenerativeAI** với model **gemini-2.
 - **Input:** `project_id`, `project_data`, `raw_tasks`
 - **Output:** `AgentResponse` với danh sách recommendations (top-3 user/task)
 - **Cache key:** `task_divider:{project_id}` (20 min)
+- **Cache note:** Cache dùng `project_id` thuần — không hash task content. Nếu LLM fail (rate limit), cache lưu kết quả rỗng. Khi DB có task mới, cache vẫn cũ → cần xóa cache thủ công hoặc đợi TTL.
 - **Flow:**
-  1. Check cache
-  2. Lấy `team_members` từ DB (users)
-  3. Build prompt với `TASK_DIVIDER_SYSTEM_PROMPT` (từ `task_divider_prompts.py`)
+  1. Check cache — nếu hit → return ngay
+  2. Nếu miss: load team_members từ DB, load tasks từ DB (fallback), load project data từ DB (fallback)
+  3. Build prompt với `TASK_DIVIDER_SYSTEM_PROMPT`
   4. LLM trả về JSON: assigned_tasks (mỗi task có `assigned_to` + `reason`)
   5. Parse JSON, resolve assignee user_id
   6. Trả về recommendations → **PM Review** trong Dashboard trước khi lưu
-  7. Cache result
+  7. Cache result 20 phút
 
 #### 2. Risk Agent (REFACTORED)
 - **Vai trò:** Phát hiện rủi ro bằng **rule-based + LLM**
@@ -394,7 +418,7 @@ class AgentState(TypedDict):
     next_step: str                     # Node tiếp theo
     needs_human_approval: bool         # Cần phê duyệt?
     approval_response: Optional[str]   # "approved" | "rejected"
-    current_phase: str                 # planning | risk_assessment | execution | monitoring
+    current_phase: str                 # ready | risk_assessment | execution | monitoring
     error: Optional[str]               # Error message
 ```
 
@@ -552,6 +576,38 @@ User: "Làm gì đó" (không có project_id)
 
 ---
 
+## 👪 Assignment Inheritance (NEW)
+
+Khi gán task cha, toàn bộ children (đệ quy) sẽ tự động được gán cùng user. Tính năng này giúp PM chỉ cần assign 1 lần duy nhất.
+
+### Rules
+
+1. **Parent assign → propagate children:** Khi gán user cho task cha → `assign_task_with_children()` lấy tất cả children đệ quy (BFS) → gán cùng user cho mỗi task → set status `InProgress` nếu đang `Todo`
+2. **New subtask → inherit:** Khi tạo subtask mới (qua API `POST /api/tasks/{id}/subtasks` hoặc UI quick form) → kiểm tra parent có assignee không → nếu có, auto-assign luôn
+3. **Unassign cha:** Không ảnh hưởng đến children (giữ nguyên assignment hiện tại)
+
+### Key Methods
+
+| Method | Description |
+|--------|-------------|
+| `db.get_task_children(task_id)` | Lấy children trực tiếp (1 level) |
+| `db.get_all_task_children_recursive(task_id)` | BFS lấy tất cả children đệ quy |
+| `db.get_task_assignee(task_id)` | Lấy assignment mới nhất của 1 task |
+| `db.assign_task_with_children(task_id, user_id, assigned_by)` | Gán task + tất cả children. DELETE cũ, INSERT mới |
+| `db.delete_task_assignments(task_id)` | Xóa tất cả assignments của 1 task |
+
+### API Endpoint
+
+```
+POST /api/tasks/{task_id}/assign
+Body: { "user_id": "uuid", "assigned_by": "uuid", "propagate_to_children": true }
+```
+
+- `propagate_to_children: true` (default) → gán task cha + tất cả children
+- `propagate_to_children: false` → chỉ gán 1 task, không propagate
+
+---
+
 ## 🖥 Frontend (Streamlit)
 
 **File:** `frontend/streamlit_app.py`
@@ -612,21 +668,22 @@ User: "Làm gì đó" (không có project_id)
 5. **✅ Assignment Review** (NEW)
    - **🤖 Gợi ý Assignment** button → gọi AI Task Divider
    - Hiển thị recommendations top-3/task với score và reason
-   - **Approve** gợi ý → lưu vào task_assignments
-   - **Manual override:** chọn user từ dropdown → gán
-   - **Manual Assign** cho tasks chưa assigned
-   - Hiển thị assignments hiện tại
+   - **Batch Assignment:** Chọn user dropdown cho từng task chưa gán → 1 nút **💾 Gán tất cả (N tasks)** → 1 DB batch write
+   - **Assignment Inheritance:** Khi gán task cha → tự động propagate xuống tất cả children (đệ quy)
+   - **Subtask Auto-Assign:** Khi tạo subtask mới, nếu task cha đã có assignee → auto gán luôn
+   - Manual assign cho tasks chưa assigned
+   - Hiển thị assignments hiện tại dạng table
 
 6. **📊 System Monitoring**
    - Redis Status (🟢/🔴)
-   - Cache statistics (task_divider:* + risk:* keys)
+   - Cache statistics (`task_divider:*` + `risk:*` + `dashboard:*` + `users:*` keys)
    - Recent Reminder Logs
    - Cache management buttons (Clear All, View Keys, Refresh Metrics)
    - Orchestrator Event Log viewer (filter by event prefix)
    - Audit Timeline
 
 ### Dashboard Data Snapshot
-`_build_dashboard_snapshot(project_id)` — gọi 10 DB queries:
+`_build_dashboard_snapshot(project_id)` — gọi 10 DB queries **và cache vào Redis 30s**:
 1. `get_project()`
 2. `get_tasks_by_project()`
 3. `get_project_members()`
@@ -637,6 +694,10 @@ User: "Làm gì đó" (không có project_id)
 8. `get_risk_summary()`
 9. `get_member_workload()`
 10. `get_audit_logs(project_id=project_id, limit=30)`
+
+**Redis cache key:** `dashboard:{project_id}` (TTL 30s) — giảm tải DB khi nhiều users xem cùng project. Clear khi CRUD task/assign qua `redis_client.delete_pattern()`.
+
+**Composite API endpoint:** `/api/projects/{id}/dashboard` — frontend có thể dùng 1 request thay 10+ nếu cần.
 
 ---
 
@@ -677,7 +738,19 @@ User: "Làm gì đó" (không có project_id)
 | `PUT` | `/api/tasks/{id}` | Cập nhật task |
 | `DELETE` | `/api/tasks/{id}` | Xóa task |
 | `PUT` | `/api/tasks/{id}/status` | Cập nhật trạng thái task |
-| `POST` | `/api/tasks/{id}/subtasks` | Tạo subtask (gắn parent_task_id) |
+| `POST` | `/api/tasks/{id}/subtasks` | Tạo subtask — **auto-inherit assignee** từ task cha nếu có |
+
+### REST API — Composite Dashboard (NEW)
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| `GET` | `/api/projects/{id}/dashboard` | **Composite endpoint** — 1 request thay 10+ queries (project + tasks + tree + members + assignments + risks + workload + audit) |
+
+### REST API — Assign with Propagation (NEW)
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| `POST` | `/api/tasks/{id}/assign` | Gán task cho user — **mặc định propagate xuống tất cả children** (đệ quy). Body: `AssignTaskRequest { user_id, assigned_by?, propagate_to_children?: true }` |
 
 ### REST API — Assignments & Risks (PHASE 3/4b/6)
 
@@ -751,17 +824,22 @@ User: "Làm gì đó" (không có project_id)
 |-----------|-----|--------|---------|
 | `task_divider:{project_id}` | 20 min | Task Divider | Tránh gọi LLM lại cho cùng project |
 | `risk:{project_id}` | 15 min | Risk Agent | Tránh phân tích rủi ro lại |
+| `dashboard:{project_id}` | 30s | Frontend + Composite API | Cache snapshot dashboard — clear khi CRUD |
+| `users:all` | 60s | Frontend sidebar | Danh sách users (ít thay đổi) |
 | `reminder_logs` | N/A (list) | Reminder Agent + ReminderJob | Log lịch sử reminder (max 100) |
 | `notification_logs` | N/A (list) | NotificationTools | Log lịch sử notification (max 100) |
 
-**Lưu ý:** `planner:{md5[:20]}` cache key đã bị xóa cùng Planner Agent.
+**Lưu ý:** Cache key `dashboard:{project_id}` tự động bị clear khi CRUD task/assign (qua `redis_client.delete_pattern(f"dashboard:{project_id}")`).
 
 ### Methods
-- `set(key, value, expire=3600)` — JSON-serialized với TTL
-- `get(key)` — JSON-deserialized
-- `delete(key)` — xóa key
-- `clear_cache()` — flushall
-- `get_reminder_logs(limit=20)` — lấy logs từ list
+| Method | Parameters | Returns | Notes |
+|--------|-----------|---------|-------|
+| `set(key, value, expire=3600)` | key, value, expire | bool | JSON-serialized với TTL |
+| `get(key)` | key | Any | JSON-deserialized, None nếu miss |
+| `delete(key)` | key | bool | Xóa 1 key |
+| `delete_pattern(pattern)` | pattern (glob) | int (count) | **NEW** — Dùng SCAN để xóa tất cả keys matching pattern (không block Redis) |
+| `clear_cache()` | — | bool | flushall |
+| `get_reminder_logs(limit=20)` | limit | list | Lấy logs từ list |
 
 ---
 

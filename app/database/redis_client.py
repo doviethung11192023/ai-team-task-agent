@@ -90,6 +90,28 @@ class RedisClient:
         except:
             return False
 
+    def delete_pattern(self, pattern: str) -> int:
+        """Xóa tất cả keys matching pattern (dùng scan để không block Redis)"""
+        if not self.client:
+            log_event(logger, "redis.delete_pattern.skip", level="debug", pattern=pattern, reason="client_unavailable")
+            return 0
+        try:
+            cursor = 0
+            deleted_count = 0
+            while True:
+                cursor, keys = self.client.scan(cursor=cursor, match=pattern, count=100)
+                if keys:
+                    self.client.delete(*keys)
+                    deleted_count += len(keys)
+                if cursor == 0:
+                    break
+            if deleted_count > 0:
+                log_event(logger, "redis.delete_pattern.success", pattern=pattern, deleted_count=deleted_count)
+            return deleted_count
+        except Exception as e:
+            log_event(logger, "redis.delete_pattern.failure", level="error", pattern=pattern, error_type=type(e).__name__, error=str(e))
+            return 0
+
     def get_reminder_logs(self, limit: int = 20) -> list:
         """Lấy lịch sử reminder logs"""
         if not self.client:

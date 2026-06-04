@@ -671,6 +671,126 @@ class SupabaseDB:
             (action, entity_type, entity_id, performed_by, Json(details or {})),
         )
 
+    # ====================== ASSIGNMENT INHERITANCE ======================
+    def get_task_children(self, task_id: str) -> List[Dict]:
+        """Lấy danh sách children trực tiếp của 1 task (không đệ quy)"""
+        return self._fetchall(
+            """
+            SELECT
+                task_id::text,
+                project_id::text,
+                title,
+                description,
+                status,
+                priority,
+                estimated_hours,
+                actual_hours,
+                start_date,
+                due_date,
+                parent_task_id::text,
+                created_at,
+                updated_at
+            FROM tasks
+            WHERE parent_task_id = %s
+            ORDER BY created_at ASC
+            """,
+            (task_id,),
+        )
+
+    def get_all_task_children_recursive(self, task_id: str) -> List[Dict]:
+        """Lấy tất cả children (đệ quy) của 1 task — BFS để tránh stack overflow"""
+        all_children = []
+        queue = [task_id]
+        seen = {task_id}
+        while queue:
+            current = queue.pop(0)
+            direct_children = self.get_task_children(current)
+            for child in direct_children:
+                child_id = child.get("task_id")
+                if child_id and child_id not in seen:
+                    seen.add(child_id)
+                    all_children.append(child)
+                    queue.append(child_id)
+        return all_children
+
+    def get_task_assignee(self, task_id: str) -> Optional[Dict]:
+        """Lấy assignee hiện tại của 1 task (lấy mới nhất)"""
+        rows = self._fetchall(
+            """
+            SELECT
+                ta.assignment_id::text,
+                ta.task_id::text,
+                ta.user_id::text,
+                ta.assigned_at,
+                ta.assigned_by::text,
+                u.name AS assignee_name,
+                u.email AS assignee_email
+            FROM task_assignments ta
+            JOIN users u ON u.user_id = ta.user_id
+            WHERE ta.task_id = %s
+            ORDER BY ta.assigned_at DESC
+            LIMIT 1
+            """,
+            (task_id,),
+        )
+        return rows[0] if rows else None
+
+    def assign_task_with_children(self, task_id: str, user_id: str, assigned_by: str) -> Dict:
+        """
+        Gán task + tất cả children (đệ quy) cho cùng user.
+        Xóa assignment cũ, INSERT assignment mới cho mỗi task.
+        Trả về số lượng task đã gán.
+        """
+        if not user_id:
+            return {"assigned_count": 0, "task_ids": []}
+
+        # Thu thập tất cả task IDs cần gán: chính nó + children đệ quy
+        task_ids_to_assign = [task_id]
+        children = self.get_all_task_children_recursive(task_id)
+        for child in children:
+            task_ids_to_assign.append(child["task_id"])
+
+        self._ensure_connection()
+        try:
+            inserted_count = 0
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                for tid in task_ids_to_assign:
+                    # Xóa assignment cũ
+                    cursor.execute(
+                        "DELETE FROM task_assignments WHERE task_id = %s",
+                        (tid,),
+                    )
+                    # INSERT assignment mới
+                    cursor.execute(
+                        """
+                        INSERT INTO task_assignments (task_id, user_id, assigned_by)
+                        VALUES (%s, %s, %s)
+                        RETURNING assignment_id::text, task_id::text, user_id::text, assigned_at, assigned_by::text
+                        """,
+                        (tid, user_id, assigned_by),
+                    )
+                    inserted_count += 1
+                    # Update status thành InProgress
+                    cursor.execute(
+                        "UPDATE tasks SET status = 'InProgress', updated_at = NOW() WHERE task_id = %s AND status = 'Todo'",
+                        (tid,),
+                    )
+            self.conn.commit()
+            return {
+                "assigned_count": inserted_count,
+                "task_ids": task_ids_to_assign,
+            }
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_task_assignments(self, task_id: str):
+        """Xóa tất cả assignments của 1 task"""
+        self._execute(
+            "DELETE FROM task_assignments WHERE task_id = %s",
+            (task_id,),
+        )
+
     # ====================== UTILITY ======================
     def calculate_project_progress(self, project_id: str) -> int:
         tasks = self.get_tasks_by_project(project_id)
